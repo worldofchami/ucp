@@ -5,13 +5,15 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/worldofchami/ucp/cmd/ucp"
 	"github.com/worldofchami/ucp/pkg/models"
+	"github.com/worldofchami/ucp/pkg/platforms/shopify"
+	"github.com/worldofchami/ucp/pkg/utils"
 )
 
 // CLI for interacting with UCP without MCP.
@@ -30,10 +32,16 @@ func main() {
 
 	godotenv.Load()
 
-	http_client := newHTTPClientWithBearerToken(os.Getenv("SHOPIFY_ACCESS_TOKEN"))
-	
-	shopify_client := &ucp.ShopifyClient{
+	http_client := utils.NewHTTPClientWithBearerToken(os.Getenv("SHOPIFY_ACCESS_TOKEN"))
+
+	region := os.Getenv("UCP_REGION")
+	if strings.TrimSpace(region) == "" {
+		region = "ZA"
+	}
+
+	shopify_client := &shopify.Client{
 		HTTPClient: http_client,
+		Region:     region,
 	}
 
 	switch os.Args[1] {
@@ -79,31 +87,7 @@ func discover(args []string) {
 	_ = enc.Encode(resp)
 }
 
-// bearerTokenTransport wraps an http.RoundTripper and adds a Bearer token header to every request
-type bearerTokenTransport struct {
-	base   http.RoundTripper
-	token  string
-}
-
-func (t *bearerTokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if t.token != "" {
-		req.Header.Set("Authorization", "Bearer "+t.token)
-	}
-	return t.base.RoundTrip(req)
-}
-
-// newHTTPClientWithBearerToken creates an HTTP client that automatically adds a Bearer token to all requests
-func newHTTPClientWithBearerToken(token string) *http.Client {
-	return &http.Client{
-		Timeout: 15 * time.Second,
-		Transport: &bearerTokenTransport{
-			base:  http.DefaultTransport,
-			token: token,
-		},
-	}
-}
-
-func discoverProducts(args []string, shopify_client *ucp.ShopifyClient) {
+func discoverProducts(args []string, shopify_client *shopify.Client) {
 	fs := flag.NewFlagSet("discover-products", flag.ExitOnError)
 	query := fs.String("query", "", "product search query (e.g. \"organic cotton sweater\")")
 	context := fs.String("context", "", "optional additional context for the search")
@@ -133,4 +117,8 @@ func discoverProducts(args []string, shopify_client *ucp.ShopifyClient) {
 		_, _ = fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
+}
+
+func createCheckout(variants []models.Variant) {
+
 }

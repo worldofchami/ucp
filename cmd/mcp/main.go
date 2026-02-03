@@ -1,52 +1,205 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/worldofchami/ucp/cmd/ucp"
+	"github.com/worldofchami/ucp/pkg/models"
+	"github.com/worldofchami/ucp/pkg/platforms/shopify"
+	"github.com/worldofchami/ucp/pkg/utils"
 )
 
 func main() {
-	ctx := context.Background()
+	// Load environment variables from .env file
+	_ = godotenv.Load()
 
-	in := bufio.NewReader(os.Stdin)
-	out := bufio.NewWriter(os.Stdout)
-	defer func() { _ = out.Flush() }()
-
-	s := &server{
-		out: out,
-		tools: []tool{
-			ucpDiscoverTool(),
-		},
+	region := os.Getenv("UCP_REGION")
+	if strings.TrimSpace(region) == "" {
+		region = "ZA"
 	}
 
-	dec := json.NewDecoder(in)
-	for {
-		var msg jsonrpcRequest
-		if err := dec.Decode(&msg); err != nil {
-			if errors.Is(err, io.EOF) {
-				return
+	s := &server{
+		tools: []tool{
+			ucpDiscoverTool(),
+			shopifySearchProductsTool(region),
+		},
+		clients: make(map[string]*sseClient),
+		mu:      &sync.RWMutex{},
+	}
+
+	// SSE endpoint for MCP streaming
+	http.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
+		// Set SSE headers
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Cache-Control")
+
+		// Generate client ID
+		clientID := r.RemoteAddr + "-" + fmt.Sprintf("%d", time.Now().UnixNano())
+		
+		// Create SSE client
+		client := &sseClient{
+			id:     clientID,
+			writer: w,
+			ch:     make(chan jsonrpcResponse, 10),
+		}
+
+		s.mu.Lock()
+		s.clients[clientID] = client
+		s.mu.Unlock()
+
+		defer func() {
+			s.mu.Lock()
+			delete(s.clients, clientID)
+			s.mu.Unlock()
+			close(client.ch)
+		}()
+
+		// Handle initial request from query params or body
+		if r.Method == http.MethodPost {
+			body, err := io.ReadAll(r.Body)
+			if err == nil && len(body) > 0 {
+				var msg jsonrpcRequest
+				if err := json.Unmarshal(body, &msg); err == nil {
+					go s.handleRequest(clientID, r.Context(), msg)
+				}
 			}
-			// Best-effort: can't respond without a valid request id.
+		}
+
+		// Stream responses
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming not supported", http.StatusInternalServerError)
 			return
 		}
-		_ = s.handle(ctx, msg)
+
+		for {
+			select {
+			case resp, ok := <-client.ch:
+				if !ok {
+					return
+				}
+				if err := s.writeSSE(w, resp); err != nil {
+					return
+				}
+				flusher.Flush()
+			case <-r.Context().Done():
+				return
+			case <-time.After(30 * time.Second):
+				// Send keepalive
+				if _, err := w.Write([]byte(": keepalive\n\n")); err != nil {
+					return
+				}
+				flusher.Flush()
+			}
+		}
+	})
+
+	// POST endpoint for sending requests (alternative to query params)
+	http.HandleFunc("/rpc", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		dec := json.NewDecoder(r.Body)
+		var msg jsonrpcRequest
+		if err := dec.Decode(&msg); err != nil {
+			http.Error(w, "invalid JSON-RPC request", http.StatusBadRequest)
+			return
+		}
+
+		// Get client ID from header or generate one
+		clientID := r.Header.Get("X-Client-ID")
+		if clientID == "" {
+			clientID = r.RemoteAddr + "-" + fmt.Sprintf("%d", time.Now().UnixNano())
+		}
+
+		s.mu.RLock()
+		_, exists := s.clients[clientID]
+		s.mu.RUnlock()
+
+		if exists {
+			go s.handleRequest(clientID, r.Context(), msg)
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"status":"accepted"}`))
+		} else {
+			// No SSE client, respond directly
+			resp := s.handleDirect(r.Context(), msg)
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			enc.SetEscapeHTML(false)
+			_ = enc.Encode(resp)
+		}
+	})
+
+	// Simple health endpoint
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	addr := ":8080"
+	fmt.Fprintf(os.Stderr, "ucp-mcp SSE server listening on %s\n", addr)
+	fmt.Fprintf(os.Stderr, "SSE endpoint: http://localhost%s/sse\n", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
+		os.Exit(1)
 	}
 }
 
 type server struct {
-	out   *bufio.Writer
-	tools []tool
+	tools   []tool
+	clients map[string]*sseClient
+	mu      *sync.RWMutex
 }
 
-func (s *server) handle(ctx context.Context, req jsonrpcRequest) error {
+type sseClient struct {
+	id     string
+	writer http.ResponseWriter
+	ch     chan jsonrpcResponse
+}
+
+func (s *server) handleRequest(clientID string, ctx context.Context, req jsonrpcRequest) {
+	var resp jsonrpcResponse
+	switch req.Method {
+	case "initialize":
+		resp = s.handleInitialize(req)
+	case "tools/list":
+		resp = s.handleToolsList(req)
+	case "tools/call":
+		resp = s.handleToolsCall(ctx, req)
+	default:
+		resp = s.replyError(req.ID, -32601, "Method not found", map[string]any{
+			"method": req.Method,
+		})
+	}
+
+	s.mu.RLock()
+	client, exists := s.clients[clientID]
+	s.mu.RUnlock()
+
+	if exists {
+		select {
+		case client.ch <- resp:
+		default:
+			// Channel full, drop message
+		}
+	}
+}
+
+func (s *server) handleDirect(ctx context.Context, req jsonrpcRequest) jsonrpcResponse {
 	switch req.Method {
 	case "initialize":
 		return s.handleInitialize(req)
@@ -61,9 +214,19 @@ func (s *server) handle(ctx context.Context, req jsonrpcRequest) error {
 	}
 }
 
-func (s *server) handleInitialize(req jsonrpcRequest) error {
+func (s *server) writeSSE(w http.ResponseWriter, resp jsonrpcResponse) error {
+	b, err := json.Marshal(resp)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", string(b))
+	return err
+}
+
+func (s *server) handleInitialize(req jsonrpcRequest) jsonrpcResponse {
 	// MCP initialize response follows "capabilities" format used by clients.
 	// Keep conservative: just tools.
+
 	result := map[string]any{
 		"protocolVersion": "2024-11-05",
 		"serverInfo": map[string]any{
@@ -77,7 +240,7 @@ func (s *server) handleInitialize(req jsonrpcRequest) error {
 	return s.replyResult(req.ID, result)
 }
 
-func (s *server) handleToolsList(req jsonrpcRequest) error {
+func (s *server) handleToolsList(req jsonrpcRequest) jsonrpcResponse {
 	list := make([]map[string]any, 0, len(s.tools))
 	for _, t := range s.tools {
 		list = append(list, map[string]any{
@@ -91,7 +254,7 @@ func (s *server) handleToolsList(req jsonrpcRequest) error {
 	})
 }
 
-func (s *server) handleToolsCall(ctx context.Context, req jsonrpcRequest) error {
+func (s *server) handleToolsCall(ctx context.Context, req jsonrpcRequest) jsonrpcResponse {
 	var p toolsCallParams
 	if err := json.Unmarshal(req.Params, &p); err != nil {
 		return s.replyError(req.ID, -32602, "Invalid params", err.Error())
@@ -122,17 +285,16 @@ func (s *server) handleToolsCall(ctx context.Context, req jsonrpcRequest) error 
 	})
 }
 
-func (s *server) replyResult(id json.RawMessage, result any) error {
-	resp := jsonrpcResponse{
+func (s *server) replyResult(id json.RawMessage, result any) jsonrpcResponse {
+	return jsonrpcResponse{
 		JSONRPC: "2.0",
 		ID:      id,
 		Result:  mustMarshalRaw(result),
 	}
-	return s.write(resp)
 }
 
-func (s *server) replyError(id json.RawMessage, code int, message string, data any) error {
-	resp := jsonrpcResponse{
+func (s *server) replyError(id json.RawMessage, code int, message string, data any) jsonrpcResponse {
+	return jsonrpcResponse{
 		JSONRPC: "2.0",
 		ID:      id,
 		Error: &jsonrpcError{
@@ -141,16 +303,6 @@ func (s *server) replyError(id json.RawMessage, code int, message string, data a
 			Data:    mustMarshalRaw(data),
 		},
 	}
-	return s.write(resp)
-}
-
-func (s *server) write(v any) error {
-	enc := json.NewEncoder(s.out)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return err
-	}
-	return s.out.Flush()
 }
 
 // --- JSON-RPC types ---
@@ -228,6 +380,75 @@ func ucpDiscoverTool() tool {
 				return nil, err
 			}
 			return resp.Content, nil
+		},
+	}
+}
+
+func shopifySearchProductsTool(region string) tool {
+	return tool{
+		Name:        "search_products",
+		Description: "Search for products via Shopify global discovery using a natural-language query.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query": map[string]any{
+					"type":        "string",
+					"description": "User's natural-language product request (e.g. \"I need a warm winter jacket\").",
+				},
+				"context": map[string]any{
+					"type":        "string",
+					"description": "Summary of the request context (e.g. \"buyer looking for a winter jacket\").",
+				},
+			},
+			"required":             []string{"query", "context"},
+			"additionalProperties": false,
+		},
+		Call: func(ctx context.Context, args map[string]any) ([]ucp.ContentItem, error) {
+			query, ok := asString(args, "query")
+			if !ok || strings.TrimSpace(query) == "" {
+				return nil, fmt.Errorf("missing required argument: query")
+			}
+			contextSummary, ok := asString(args, "context")
+			if !ok {
+				contextSummary = ""
+			}
+
+			// Ensure environment is loaded (in case .env was updated)
+			_ = godotenv.Load()
+
+			token := os.Getenv("SHOPIFY_ACCESS_TOKEN")
+			if token == "" {
+				return nil, fmt.Errorf("SHOPIFY_ACCESS_TOKEN environment variable is not set")
+			}
+			
+			http_client := utils.NewHTTPClientWithBearerToken(token)
+
+			shopify_client := &shopify.Client{
+				HTTPClient: http_client,
+				Region:     region,
+			}
+
+			platformProducts, err := shopify_client.DiscoverProducts(query, contextSummary)
+			if err != nil {
+				return nil, err
+			}
+
+			standardised := make([]models.Product, 0, len(platformProducts))
+			for _, p := range platformProducts {
+				standardised = append(standardised, p.Standardise())
+			}
+
+			b, err := json.MarshalIndent(standardised, "", "  ")
+			if err != nil {
+				return nil, err
+			}
+
+			return []ucp.ContentItem{
+				{
+					Type: "text",
+					Text: string(b),
+				},
+			}, nil
 		},
 	}
 }

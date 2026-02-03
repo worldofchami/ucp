@@ -51,7 +51,6 @@ func NewClient(opts ...Option) *Client {
 }
 
 // Discover fetches UCP discovery from a store URL via GET /.well-known/ucp.
-// It returns an MCP-shaped ToolResponse so it can be reused by an MCP server or other callers.
 func (c *Client) Discover(ctx context.Context, storeURL string) (ToolResponse, error) {
 	discoveryURL, err := Resolve(storeURL, "/.well-known/ucp")
 	if err != nil {

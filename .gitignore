@@ -1,0 +1,8 @@
+*.exe
+*.out
+*.test
+*.prof
+
+# Build output
+/bin/
+.env

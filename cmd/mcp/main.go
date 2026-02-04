@@ -31,6 +31,7 @@ func main() {
 		tools: []tool{
 			ucpDiscoverTool(),
 			shopifySearchProductsTool(region),
+			createCheckoutTool(),
 		},
 		clients: make(map[string]*sseClient),
 		mu:      &sync.RWMutex{},
@@ -47,7 +48,7 @@ func main() {
 
 		// Generate client ID
 		clientID := r.RemoteAddr + "-" + fmt.Sprintf("%d", time.Now().UnixNano())
-		
+
 		// Create SSE client
 		client := &sseClient{
 			id:     clientID,
@@ -443,7 +444,7 @@ func shopifySearchProductsTool(region string) tool {
 			if token == "" {
 				return nil, fmt.Errorf("SHOPIFY_ACCESS_TOKEN environment variable is not set")
 			}
-			
+
 			http_client := utils.NewHTTPClientWithBearerToken(token)
 
 			shopify_client := &shopify.Client{
@@ -485,6 +486,209 @@ func asString(args map[string]any, key string) (string, bool) {
 	return s, ok
 }
 
+func createCheckoutTool() tool {
+	return tool{
+		Name:        "create_checkout",
+		Description: "Create a new checkout session at a UCP-compliant store. Initiates checkout with line items, buyer info, and context.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"store_url": map[string]any{
+					"type":        "string",
+					"description": "Store base URL (e.g. https://example.com). Used for UCP discovery to find checkout endpoint.",
+				},
+				"checkout": map[string]any{
+					"type":        "object",
+					"description": "Checkout session data",
+					"properties": map[string]any{
+						"line_items": map[string]any{
+							"type":        "array",
+							"description": "List of line items to checkout. Each item.id should correspond to the product variant id.",
+							"items": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"item": map[string]any{
+										"type": "object",
+										"properties": map[string]any{
+											"id": map[string]any{
+												"type":        "string",
+												"description": "Product variant id",
+											},
+										},
+										"required": []string{"id"},
+									},
+									"quantity": map[string]any{
+										"type":        "integer",
+										"description": "Quantity to purchase",
+										"minimum":     1,
+									},
+								},
+								"required": []string{"item", "quantity"},
+							},
+						},
+						"buyer": map[string]any{
+							"type":        "object",
+							"description": "Buyer information (optional)",
+							"properties": map[string]any{
+								"email": map[string]any{
+									"type": "string",
+								},
+								"first_name": map[string]any{
+									"type": "string",
+								},
+								"last_name": map[string]any{
+									"type": "string",
+								},
+								"phone_number": map[string]any{
+									"type": "string",
+								},
+							},
+						},
+						"context": map[string]any{
+							"type":        "object",
+							"description": "Provisional buyer signals for relevance and localization",
+							"properties": map[string]any{
+								"address_country": map[string]any{
+									"type":        "string",
+									"description": "ISO 3166-1 alpha-2 country code",
+								},
+								"address_region": map[string]any{
+									"type": "string",
+								},
+								"postal_code": map[string]any{
+									"type": "string",
+								},
+							},
+						},
+						"currency": map[string]any{
+							"type":        "string",
+							"description": "ISO 4217 currency code (optional)",
+							"pattern":     "^[A-Z]{3}$",
+						},
+					},
+					"required": []string{"line_items"},
+				},
+			},
+			"required":             []string{"store_url", "checkout"},
+			"additionalProperties": false,
+		},
+		Call: func(ctx context.Context, args map[string]any) ([]ucp.ContentItem, error) {
+			storeURL, ok := asString(args, "store_url")
+			if !ok || strings.TrimSpace(storeURL) == "" {
+				return nil, fmt.Errorf("missing required argument: store_url")
+			}
+
+			checkoutData, ok := args["checkout"].(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("missing required argument: checkout")
+			}
+
+			// Step 1: Discover UCP endpoint
+			client := ucp.NewClient(ucp.WithUserAgent("ucp-mcp/0.1.0"))
+			discoveryResp, err := client.Discover(ctx, storeURL)
+			if err != nil {
+				return nil, fmt.Errorf("failed to discover UCP endpoint: %w", err)
+			}
+
+			// Parse discovery response to find MCP endpoint
+			discoveryText := ""
+			if len(discoveryResp.Content) > 0 {
+				discoveryText = discoveryResp.Content[0].Text
+			}
+
+			var discovery struct {
+				UCP struct {
+					Services map[string][]struct {
+						Transport string `json:"transport"`
+						Endpoint  string `json:"endpoint"`
+					} `json:"services"`
+				} `json:"ucp"`
+			}
+
+			if err := json.Unmarshal([]byte(discoveryText), &discovery); err != nil {
+				return nil, fmt.Errorf("failed to parse discovery response: %w", err)
+			}
+
+			// Find MCP endpoint
+			var mcpEndpoint string
+			for _, service := range discovery.UCP.Services["dev.ucp.shopping"] {
+				if service.Transport == "mcp" && service.Endpoint != "" {
+					mcpEndpoint = service.Endpoint
+					break
+				}
+			}
+
+			if mcpEndpoint == "" {
+				return nil, fmt.Errorf("no MCP endpoint found in UCP discovery")
+			}
+
+			// Step 2: Build JSON-RPC request for create_checkout
+			reqBody := map[string]any{
+				"jsonrpc": "2.0",
+				"method":  "tools/call",
+				"params": map[string]any{
+					"name": "create_checkout",
+					"arguments": map[string]any{
+						"meta": map[string]any{
+							"ucp-agent": map[string]any{
+								"profile": "https://platform.example/profiles/shopping-agent.json",
+							},
+						},
+						"checkout": checkoutData,
+					},
+				},
+				"id": 1,
+			}
+
+			reqJSON, err := json.Marshal(reqBody)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal request: %w", err)
+			}
+
+			// Step 3: Make the request
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, mcpEndpoint, strings.NewReader(string(reqJSON)))
+			if err != nil {
+				return nil, fmt.Errorf("failed to create request: %w", err)
+			}
+
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("Accept", "application/json")
+			httpReq.Header.Set("User-Agent", "ucp-mcp/0.1.0")
+
+			httpResp, err := client.HTTP.Do(httpReq)
+			if err != nil {
+				return nil, fmt.Errorf("checkout request [1] failed: %w", err)
+			}
+			defer func() { _ = httpResp.Body.Close() }()
+
+			respBody, err := io.ReadAll(httpResp.Body)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read response body: %w", err)
+			}
+
+			if httpResp.StatusCode < 200 || httpResp.StatusCode > 299 {
+				return nil, fmt.Errorf("checkout request [2] failed: %s (status %d)", string(respBody), httpResp.StatusCode)
+			}
+
+			// Pretty print the response
+			var respObj any
+			if err := json.Unmarshal(respBody, &respObj); err == nil {
+				prettyJSON, err := json.MarshalIndent(respObj, "", "  ")
+				if err == nil {
+					respBody = prettyJSON
+				}
+			}
+
+			return []ucp.ContentItem{
+				{
+					Type: "text",
+					Text: string(respBody),
+				},
+			}, nil
+		},
+	}
+}
+
 // --- Logging helpers ---
 
 const (
@@ -495,18 +699,18 @@ const (
 var logMu sync.Mutex
 
 type toolCallLogEntry struct {
-	Time      time.Time         `json:"time"`
-	RequestID json.RawMessage   `json:"request_id,omitempty"`
-	Tool      string            `json:"tool"`
-	Arguments map[string]any    `json:"arguments"`
-}
-
-type toolOutputLogEntry struct {
 	Time      time.Time       `json:"time"`
 	RequestID json.RawMessage `json:"request_id,omitempty"`
 	Tool      string          `json:"tool"`
+	Arguments map[string]any  `json:"arguments"`
+}
+
+type toolOutputLogEntry struct {
+	Time      time.Time         `json:"time"`
+	RequestID json.RawMessage   `json:"request_id,omitempty"`
+	Tool      string            `json:"tool"`
 	Content   []ucp.ContentItem `json:"content,omitempty"`
-	Error     string          `json:"error,omitempty"`
+	Error     string            `json:"error,omitempty"`
 }
 
 func logToolCall(filename string, entry toolCallLogEntry) {

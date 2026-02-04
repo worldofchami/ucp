@@ -60,8 +60,8 @@ type ShopifyPriceRange struct {
 }
 
 type ShopifyMoney struct {
-	Amount       float64 	`json:"amount"`
-	CurrencyCode string 	`json:"currencyCode"`
+	Amount   float64 `json:"amount"`
+	Currency string  `json:"currency"`
 }
 
 type ShopifyProduct struct {
@@ -115,6 +115,12 @@ func (product *ShopifyProduct) Standardise() Product {
 				Name:  opt.Name,
 				Value: opt.Value,
 			})
+		}
+
+		// Variant price.
+		v.Price = Money{
+			Amount:   product.SelectedProductVariant.Price.Amount,
+			Currency: product.SelectedProductVariant.Price.Currency,
 		}
 
 		v.AvailableForSale = product.SelectedProductVariant.AvailableForSale
@@ -234,6 +240,10 @@ func (offer *ShopifyOffer) Standardise() Product {
 			Title:           v.DisplayName,
 			Url:             varUrl,
 			Image:           varImg,
+			Price: Money{
+				Amount:   v.Price.Amount,
+				Currency: v.Price.Currency,
+			},
 			AvailableForSale: v.AvailableForSale,
 		}
 

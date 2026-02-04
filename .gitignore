@@ -6,3 +6,7 @@
 # Build output
 /bin/
 .env
+
+logs
+
+*.json

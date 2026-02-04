@@ -5,6 +5,15 @@ type ImageWithUrl struct {
 	Alt 		string 		`json:"alt"`
 }
 
+// Money represents a monetary value in a specific currency.
+// The amount is kept in the same units as provided by the
+// underlying platform (for Shopify this is currently minor
+// units such as cents).
+type Money struct {
+	Amount   float64 `json:"amount"`
+	Currency string  `json:"currency"`
+}
+
 type Product struct{
 	Id 				string 		`json:"id"`
 	Title 			string 		`json:"title"`
@@ -19,6 +28,8 @@ type Variant struct {
 	Title           string          `json:"title"`
 	Url             string          `json:"url,omitempty"`
 	Image           ImageWithUrl    `json:"image"`
+	// Price is the per-variant price, when available.
+	Price           Money           `json:"price,omitempty"`
 	Options         []VariantOption `json:"options,omitempty"`
 	AvailableForSale bool           `json:"available_for_sale"`
 }

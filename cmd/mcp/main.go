@@ -260,6 +260,14 @@ func (s *server) handleToolsCall(ctx context.Context, req jsonrpcRequest) jsonrp
 		return s.replyError(req.ID, -32602, "Invalid params", err.Error())
 	}
 
+	// Log tool call with parameters
+	logToolCall(toolCallLogFile, toolCallLogEntry{
+		Time:      time.Now().UTC(),
+		RequestID: req.ID,
+		Tool:      p.Name,
+		Arguments: p.Arguments,
+	})
+
 	var t *tool
 	for i := range s.tools {
 		if s.tools[i].Name == p.Name {
@@ -276,8 +284,23 @@ func (s *server) handleToolsCall(ctx context.Context, req jsonrpcRequest) jsonrp
 
 	content, err := t.Call(ctx, p.Arguments)
 	if err != nil {
+		// Log tool error output
+		logToolOutput(toolOutputLogFile, toolOutputLogEntry{
+			Time:      time.Now().UTC(),
+			RequestID: req.ID,
+			Tool:      p.Name,
+			Error:     err.Error(),
+		})
 		return s.replyError(req.ID, 1, "Tool execution error", err.Error())
 	}
+
+	// Log successful tool output
+	logToolOutput(toolOutputLogFile, toolOutputLogEntry{
+		Time:      time.Now().UTC(),
+		RequestID: req.ID,
+		Tool:      p.Name,
+		Content:   content,
+	})
 
 	// MCP tool result uses `content` array with typed items.
 	return s.replyResult(req.ID, map[string]any{
@@ -460,4 +483,58 @@ func asString(args map[string]any, key string) (string, bool) {
 	}
 	s, ok := v.(string)
 	return s, ok
+}
+
+// --- Logging helpers ---
+
+const (
+	toolCallLogFile   = "logs/tool_calls.log"
+	toolOutputLogFile = "logs/tool_outputs.log"
+)
+
+var logMu sync.Mutex
+
+type toolCallLogEntry struct {
+	Time      time.Time         `json:"time"`
+	RequestID json.RawMessage   `json:"request_id,omitempty"`
+	Tool      string            `json:"tool"`
+	Arguments map[string]any    `json:"arguments"`
+}
+
+type toolOutputLogEntry struct {
+	Time      time.Time       `json:"time"`
+	RequestID json.RawMessage `json:"request_id,omitempty"`
+	Tool      string          `json:"tool"`
+	Content   []ucp.ContentItem `json:"content,omitempty"`
+	Error     string          `json:"error,omitempty"`
+}
+
+func logToolCall(filename string, entry toolCallLogEntry) {
+	logJSONLine(filename, entry)
+}
+
+func logToolOutput(filename string, entry toolOutputLogEntry) {
+	logJSONLine(filename, entry)
+}
+
+func logJSONLine(filename string, v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "log marshal error: %v\n", err)
+		return
+	}
+
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "log open error: %v\n", err)
+		return
+	}
+	defer f.Close()
+
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		fmt.Fprintf(os.Stderr, "log write error: %v\n", err)
+	}
 }

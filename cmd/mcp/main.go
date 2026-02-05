@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -489,13 +490,13 @@ func asString(args map[string]any, key string) (string, bool) {
 func createCheckoutTool() tool {
 	return tool{
 		Name:        "create_checkout",
-		Description: "Create a new checkout session at a UCP-compliant store. Initiates checkout with line items, buyer info, and context.",
+		Description: "Create a new checkout session at a Shopify store. Initiates checkout with line items, buyer info, and context. For Shopify stores, uses the MCP endpoint directly.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"store_url": map[string]any{
 					"type":        "string",
-					"description": "Store base URL (e.g. https://example.com). Used for UCP discovery to find checkout endpoint.",
+					"description": "Shopify store URL (e.g. https://my-store.myshopify.com or https://example.com).",
 				},
 				"checkout": map[string]any{
 					"type":        "object",
@@ -503,7 +504,7 @@ func createCheckoutTool() tool {
 					"properties": map[string]any{
 						"line_items": map[string]any{
 							"type":        "array",
-							"description": "List of line items to checkout. Each item.id should correspond to the product variant id.",
+							"description": "List of line items to checkout. Each item.id should be a Shopify ProductVariant GID (e.g., gid://shopify/ProductVariant/12345678901).",
 							"items": map[string]any{
 								"type": "object",
 								"properties": map[string]any{
@@ -512,7 +513,7 @@ func createCheckoutTool() tool {
 										"properties": map[string]any{
 											"id": map[string]any{
 												"type":        "string",
-												"description": "Product variant id",
+												"description": "Shopify ProductVariant GID (e.g., gid://shopify/ProductVariant/12345678901)",
 											},
 										},
 										"required": []string{"id"},
@@ -526,12 +527,18 @@ func createCheckoutTool() tool {
 								"required": []string{"item", "quantity"},
 							},
 						},
+						"currency": map[string]any{
+							"type":        "string",
+							"description": "ISO 4217 currency code (required)",
+							"pattern":     "^[A-Z]{3}$",
+						},
 						"buyer": map[string]any{
 							"type":        "object",
-							"description": "Buyer information (optional)",
+							"description": "Buyer information",
 							"properties": map[string]any{
 								"email": map[string]any{
-									"type": "string",
+									"type":        "string",
+									"description": "Buyer's email for order confirmation",
 								},
 								"first_name": map[string]any{
 									"type": "string",
@@ -542,31 +549,145 @@ func createCheckoutTool() tool {
 								"phone_number": map[string]any{
 									"type": "string",
 								},
+								"full_name": map[string]any{
+									"type": "string",
+								},
+								"consent": map[string]any{
+									"type":        "object",
+									"description": "Buyer consent preferences",
+									"properties": map[string]any{
+										"analytics": map[string]any{
+											"type": "boolean",
+										},
+										"marketing": map[string]any{
+											"type": "boolean",
+										},
+										"preferences": map[string]any{
+											"type": "boolean",
+										},
+										"sale_of_data": map[string]any{
+											"type": "boolean",
+										},
+									},
+								},
 							},
 						},
-						"context": map[string]any{
+						"payment": map[string]any{
 							"type":        "object",
-							"description": "Provisional buyer signals for relevance and localization",
+							"description": "Payment information including instruments and selected instrument",
 							"properties": map[string]any{
-								"address_country": map[string]any{
-									"type":        "string",
-									"description": "ISO 3166-1 alpha-2 country code",
+								"instruments": map[string]any{
+									"type": "array",
+									"items": map[string]any{
+										"type": "object",
+										"properties": map[string]any{
+											"id": map[string]any{
+												"type": "string",
+											},
+											"handler_id": map[string]any{
+												"type": "string",
+											},
+											"type": map[string]any{
+												"type": "string",
+											},
+											"brand": map[string]any{
+												"type": "string",
+											},
+											"last_digits": map[string]any{
+												"type": "string",
+											},
+											"billing_address": map[string]any{
+												"type": "object",
+												"properties": map[string]any{
+													"full_name": map[string]any{
+														"type": "string",
+													},
+													"address_country": map[string]any{
+														"type": "string",
+													},
+													"street_address": map[string]any{
+														"type": "string",
+													},
+													"address_locality": map[string]any{
+														"type": "string",
+													},
+													"address_region": map[string]any{
+														"type": "string",
+													},
+													"postal_code": map[string]any{
+														"type": "string",
+													},
+													"phone_number": map[string]any{
+														"type": "string",
+													},
+												},
+											},
+											"credential": map[string]any{
+												"type": "object",
+												"properties": map[string]any{
+													"type": map[string]any{
+														"type": "string",
+													},
+													"card_number_type": map[string]any{
+														"type": "string",
+													},
+												},
+											},
+										},
+									},
 								},
-								"address_region": map[string]any{
-									"type": "string",
-								},
-								"postal_code": map[string]any{
+								"selected_instrument_id": map[string]any{
 									"type": "string",
 								},
 							},
 						},
-						"currency": map[string]any{
-							"type":        "string",
-							"description": "ISO 4217 currency code (optional)",
-							"pattern":     "^[A-Z]{3}$",
+						"discounts": map[string]any{
+							"type":        "object",
+							"description": "Applied discount codes",
+							"properties": map[string]any{
+								"codes": map[string]any{
+									"type": "array",
+									"items": map[string]any{
+										"type": "string",
+									},
+								},
+							},
+						},
+						"fulfillment": map[string]any{
+							"type":        "object",
+							"description": "Fulfillment preferences",
+							"properties": map[string]any{
+								"methods": map[string]any{
+									"type": "array",
+									"items": map[string]any{
+										"type": "object",
+										"properties": map[string]any{
+											"type": map[string]any{
+												"type": "string",
+												"enum": []string{"shipping", "pickup"},
+											},
+											"destinations": map[string]any{
+												"type": "array",
+												"items": map[string]any{
+													"type": "object",
+													"properties": map[string]any{
+														"first_name":       map[string]any{"type": "string"},
+														"last_name":        map[string]any{"type": "string"},
+														"street_address":   map[string]any{"type": "string"},
+														"address_locality": map[string]any{"type": "string"},
+														"address_region":   map[string]any{"type": "string"},
+														"postal_code":      map[string]any{"type": "string"},
+														"address_country":  map[string]any{"type": "string"},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
 						},
 					},
-					"required": []string{"line_items"},
+					"required": []string{"line_items", "currency"},
 				},
 			},
 			"required":             []string{"store_url", "checkout"},
@@ -583,61 +704,41 @@ func createCheckoutTool() tool {
 				return nil, fmt.Errorf("missing required argument: checkout")
 			}
 
-			// Step 1: Discover UCP endpoint
-			client := ucp.NewClient(ucp.WithUserAgent("ucp-mcp/0.1.0"))
-			discoveryResp, err := client.Discover(ctx, storeURL)
-			if err != nil {
-				return nil, fmt.Errorf("failed to discover UCP endpoint: %w", err)
+			// Normalize store URL
+			storeURL = strings.TrimSpace(storeURL)
+			if !strings.HasPrefix(storeURL, "http://") && !strings.HasPrefix(storeURL, "https://") {
+				storeURL = "https://" + storeURL
 			}
 
-			// Parse discovery response to find MCP endpoint
-			discoveryText := ""
-			if len(discoveryResp.Content) > 0 {
-				discoveryText = discoveryResp.Content[0].Text
+			// Get Shopify access token
+			token := os.Getenv("SHOPIFY_ACCESS_TOKEN")
+			if token == "" {
+				return nil, fmt.Errorf("SHOPIFY_ACCESS_TOKEN environment variable is not set")
 			}
 
-			var discovery struct {
-				UCP struct {
-					Services map[string][]struct {
-						Transport string `json:"transport"`
-						Endpoint  string `json:"endpoint"`
-					} `json:"services"`
-				} `json:"ucp"`
-			}
+			// Build Shopify MCP endpoint URL
+			mcpEndpoint := strings.TrimSuffix(storeURL, "/") + "/api/ucp/mcp"
 
-			if err := json.Unmarshal([]byte(discoveryText), &discovery); err != nil {
-				return nil, fmt.Errorf("failed to parse discovery response: %w", err)
-			}
+			// Generate idempotency key
+			idempotencyKey := fmt.Sprintf("%d-%s", time.Now().UnixNano(), storeURL)
 
-			// Find MCP endpoint
-			var mcpEndpoint string
-			for _, service := range discovery.UCP.Services["dev.ucp.shopping"] {
-				if service.Transport == "mcp" && service.Endpoint != "" {
-					mcpEndpoint = service.Endpoint
-					break
-				}
-			}
-
-			if mcpEndpoint == "" {
-				return nil, fmt.Errorf("no MCP endpoint found in UCP discovery")
-			}
-
-			// Step 2: Build JSON-RPC request for create_checkout
+			// Build JSON-RPC request for create_checkout per Shopify docs
 			reqBody := map[string]any{
 				"jsonrpc": "2.0",
 				"method":  "tools/call",
+				"id":      1,
 				"params": map[string]any{
 					"name": "create_checkout",
 					"arguments": map[string]any{
-						"meta": map[string]any{
-							"ucp-agent": map[string]any{
-								"profile": "https://platform.example/profiles/shopping-agent.json",
+						"_meta": map[string]any{
+							"ucp": map[string]any{
+								"profile": "https://ckmybgppjioghrtphdlr.supabase.co/storage/v1/object/public/json/agent_profile.json",
 							},
+							"idempotency-key": idempotencyKey,
 						},
 						"checkout": checkoutData,
 					},
 				},
-				"id": 1,
 			}
 
 			reqJSON, err := json.Marshal(reqBody)
@@ -645,7 +746,7 @@ func createCheckoutTool() tool {
 				return nil, fmt.Errorf("failed to marshal request: %w", err)
 			}
 
-			// Step 3: Make the request
+			// Make the request
 			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, mcpEndpoint, strings.NewReader(string(reqJSON)))
 			if err != nil {
 				return nil, fmt.Errorf("failed to create request: %w", err)
@@ -654,10 +755,12 @@ func createCheckoutTool() tool {
 			httpReq.Header.Set("Content-Type", "application/json")
 			httpReq.Header.Set("Accept", "application/json")
 			httpReq.Header.Set("User-Agent", "ucp-mcp/0.1.0")
+			httpReq.Header.Set("Authorization", "Bearer "+token)
 
-			httpResp, err := client.HTTP.Do(httpReq)
+			client := &http.Client{Timeout: 30 * time.Second}
+			httpResp, err := client.Do(httpReq)
 			if err != nil {
-				return nil, fmt.Errorf("checkout request [1] failed: %w", err)
+				return nil, fmt.Errorf("checkout request failed: %w", err)
 			}
 			defer func() { _ = httpResp.Body.Close() }()
 
@@ -667,24 +770,63 @@ func createCheckoutTool() tool {
 			}
 
 			if httpResp.StatusCode < 200 || httpResp.StatusCode > 299 {
-				return nil, fmt.Errorf("checkout request [2] failed: %s (status %d)", string(respBody), httpResp.StatusCode)
+				return nil, fmt.Errorf("checkout request failed: %s (status %d)", string(respBody), httpResp.StatusCode)
 			}
 
-			// Pretty print the response
-			var respObj any
-			if err := json.Unmarshal(respBody, &respObj); err == nil {
-				prettyJSON, err := json.MarshalIndent(respObj, "", "  ")
-				if err == nil {
-					respBody = prettyJSON
-				}
+			log.Print(string(respBody))
+
+			// Parse the MCP response format
+			var mcpResponse struct {
+				JSONRPC string `json:"jsonrpc"`
+				ID      int    `json:"id"`
+				Result  struct {
+					Content []struct {
+						Type string `json:"type"`
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"result"`
+				Error *struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+					Data    any    `json:"data"`
+				} `json:"error"`
 			}
 
-			return []ucp.ContentItem{
-				{
+			if err := json.Unmarshal(respBody, &mcpResponse); err != nil {
+				// If parsing fails, return raw response
+				return []ucp.ContentItem{{
 					Type: "text",
 					Text: string(respBody),
-				},
-			}, nil
+				}}, nil
+			}
+
+			// Handle error response
+			if mcpResponse.Error != nil {
+				errorJSON, _ := json.MarshalIndent(mcpResponse.Error, "", "  ")
+				return nil, fmt.Errorf("checkout error: %s", string(errorJSON))
+			}
+
+			// Extract checkout data from content
+			if len(mcpResponse.Result.Content) > 0 && mcpResponse.Result.Content[0].Type == "text" {
+				// Pretty print the checkout data
+				var checkoutData map[string]any
+				if err := json.Unmarshal([]byte(mcpResponse.Result.Content[0].Text), &checkoutData); err == nil {
+					prettyJSON, _ := json.MarshalIndent(checkoutData, "", "  ")
+					return []ucp.ContentItem{{
+						Type: "text",
+						Text: string(prettyJSON),
+					}}, nil
+				}
+				return []ucp.ContentItem{{
+					Type: "text",
+					Text: mcpResponse.Result.Content[0].Text,
+				}}, nil
+			}
+
+			return []ucp.ContentItem{{
+				Type: "text",
+				Text: string(respBody),
+			}}, nil
 		},
 	}
 }

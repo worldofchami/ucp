@@ -9,6 +9,6 @@
 
 logs
 
-*.json
-
 .DS_Store
+
+examples

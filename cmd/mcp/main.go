@@ -33,6 +33,10 @@ func main() {
 			ucpDiscoverTool(),
 			shopifySearchProductsTool(region),
 			createCheckoutTool(),
+			searchShopCatalogTool(),
+			getCartTool(),
+			updateCartTool(),
+			searchShopPoliciesAndFaqsTool(),
 		},
 		clients: make(map[string]*sseClient),
 		mu:      &sync.RWMutex{},
@@ -827,6 +831,325 @@ func createCheckoutTool() tool {
 				Type: "text",
 				Text: string(respBody),
 			}}, nil
+		},
+	}
+}
+
+// --- Storefront MCP Helper ---
+
+// storefrontMCPProxy proxies a tool call to a Shopify Storefront MCP server
+func storefrontMCPProxy(ctx context.Context, storeURL, toolName string, arguments map[string]any) ([]ucp.ContentItem, error) {
+	// Normalize store URL
+	storeURL = strings.TrimSpace(storeURL)
+	if !strings.HasPrefix(storeURL, "http://") && !strings.HasPrefix(storeURL, "https://") {
+		storeURL = "https://" + storeURL
+	}
+
+	// Build Storefront MCP endpoint
+	mcpEndpoint := strings.TrimSuffix(storeURL, "/") + "/api/mcp"
+
+	// Build JSON-RPC request
+	reqBody := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "tools/call",
+		"id":      1,
+		"params": map[string]any{
+			"name":      toolName,
+			"arguments": arguments,
+		},
+	}
+
+	reqJSON, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Make the request (no auth required for Storefront MCP)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, mcpEndpoint, strings.NewReader(string(reqJSON)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("User-Agent", "ucp-mcp/0.1.0")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("storefront MCP request failed: %w", err)
+	}
+	defer func() { _ = httpResp.Body.Close() }()
+
+	respBody, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if httpResp.StatusCode < 200 || httpResp.StatusCode > 299 {
+		return nil, fmt.Errorf("storefront MCP request failed: %s (status %d)", string(respBody), httpResp.StatusCode)
+	}
+
+	// Parse the MCP response format
+	var mcpResponse struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      int    `json:"id"`
+		Result  struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Data    any    `json:"data"`
+		} `json:"error"`
+	}
+
+	if err := json.Unmarshal(respBody, &mcpResponse); err != nil {
+		// If parsing fails, return raw response
+		return []ucp.ContentItem{{
+			Type: "text",
+			Text: string(respBody),
+		}}, nil
+	}
+
+	// Handle error response
+	if mcpResponse.Error != nil {
+		errorJSON, _ := json.MarshalIndent(mcpResponse.Error, "", "  ")
+		return nil, fmt.Errorf("storefront MCP error: %s", string(errorJSON))
+	}
+
+	// Return the content from the response
+	if len(mcpResponse.Result.Content) > 0 {
+		result := make([]ucp.ContentItem, 0, len(mcpResponse.Result.Content))
+		for _, item := range mcpResponse.Result.Content {
+			// Pretty print JSON content
+			var jsonContent any
+			if err := json.Unmarshal([]byte(item.Text), &jsonContent); err == nil {
+				prettyJSON, _ := json.MarshalIndent(jsonContent, "", "  ")
+				result = append(result, ucp.ContentItem{
+					Type: item.Type,
+					Text: string(prettyJSON),
+				})
+			} else {
+				result = append(result, ucp.ContentItem{
+					Type: item.Type,
+					Text: item.Text,
+				})
+			}
+		}
+		return result, nil
+	}
+
+	return []ucp.ContentItem{{
+		Type: "text",
+		Text: string(respBody),
+	}}, nil
+}
+
+// --- Storefront MCP Tools ---
+
+func searchShopCatalogTool() tool {
+	return tool{
+		Name:        "search_shop_catalog",
+		Description: "Search the store's product catalog to find items that match customer needs. Returns product details including name, price, variant ID, URL, and image.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"store_url": map[string]any{
+					"type":        "string",
+					"description": "Shopify store URL (e.g. https://my-store.myshopify.com or https://example.com).",
+				},
+				"query": map[string]any{
+					"type":        "string",
+					"description": "The search query to find related products (required)",
+				},
+				"context": map[string]any{
+					"type":        "string",
+					"description": "Additional information to help tailor results (required)",
+				},
+			},
+			"required":             []string{"store_url", "query", "context"},
+			"additionalProperties": false,
+		},
+		Call: func(ctx context.Context, args map[string]any) ([]ucp.ContentItem, error) {
+			storeURL, ok := asString(args, "store_url")
+			if !ok || strings.TrimSpace(storeURL) == "" {
+				return nil, fmt.Errorf("missing required argument: store_url")
+			}
+
+			query, ok := asString(args, "query")
+			if !ok || strings.TrimSpace(query) == "" {
+				return nil, fmt.Errorf("missing required argument: query")
+			}
+
+			context, ok := asString(args, "context")
+			if !ok {
+				context = ""
+			}
+
+			arguments := map[string]any{
+				"query":   query,
+				"context": context,
+			}
+
+			return storefrontMCPProxy(ctx, storeURL, "search_shop_catalog", arguments)
+		},
+	}
+}
+
+func getCartTool() tool {
+	return tool{
+		Name:        "get_cart",
+		Description: "Retrieves the current contents of a cart, including item details and checkout URL.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"store_url": map[string]any{
+					"type":        "string",
+					"description": "Shopify store URL (e.g. https://my-store.myshopify.com or https://example.com).",
+				},
+				"cart_id": map[string]any{
+					"type":        "string",
+					"description": "ID of an existing cart (e.g., gid://shopify/Cart/abc123def456).",
+				},
+			},
+			"required":             []string{"store_url", "cart_id"},
+			"additionalProperties": false,
+		},
+		Call: func(ctx context.Context, args map[string]any) ([]ucp.ContentItem, error) {
+			storeURL, ok := asString(args, "store_url")
+			if !ok || strings.TrimSpace(storeURL) == "" {
+				return nil, fmt.Errorf("missing required argument: store_url")
+			}
+
+			cartID, ok := asString(args, "cart_id")
+			if !ok || strings.TrimSpace(cartID) == "" {
+				return nil, fmt.Errorf("missing required argument: cart_id")
+			}
+
+			arguments := map[string]any{
+				"cart_id": cartID,
+			}
+
+			return storefrontMCPProxy(ctx, storeURL, "get_cart", arguments)
+		},
+	}
+}
+
+func updateCartTool() tool {
+	return tool{
+		Name:        "update_cart",
+		Description: "Updates quantities of items in an existing cart or adds new items. Creates a new cart if no cart ID is provided. Set quantity to 0 to remove an item.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"store_url": map[string]any{
+					"type":        "string",
+					"description": "Shopify store URL (e.g. https://my-store.myshopify.com or https://example.com).",
+				},
+				"cart_id": map[string]any{
+					"type":        "string",
+					"description": "ID of the cart to update. Creates a new cart if not provided.",
+				},
+				"add_items": map[string]any{
+					"type":        "array",
+					"description": "Array of items to add to the cart (required)",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"line_item_id": map[string]any{
+								"type":        "string",
+								"description": "Existing cart line item ID (for updating existing items)",
+							},
+							"product_variant_id": map[string]any{
+								"type":        "string",
+								"description": "Product variant ID (e.g., gid://shopify/ProductVariant/123456)",
+							},
+							"quantity": map[string]any{
+								"type":        "integer",
+								"description": "Quantity (set to 0 to remove item)",
+								"minimum":     0,
+							},
+						},
+						"required": []string{"quantity"},
+					},
+				},
+			},
+			"required":             []string{"store_url", "add_items"},
+			"additionalProperties": false,
+		},
+		Call: func(ctx context.Context, args map[string]any) ([]ucp.ContentItem, error) {
+			storeURL, ok := asString(args, "store_url")
+			if !ok || strings.TrimSpace(storeURL) == "" {
+				return nil, fmt.Errorf("missing required argument: store_url")
+			}
+
+			addItems, ok := args["add_items"].([]any)
+			if !ok || len(addItems) == 0 {
+				return nil, fmt.Errorf("missing required argument: add_items (must be a non-empty array)")
+			}
+
+			arguments := map[string]any{
+				"add_items": addItems,
+			}
+
+			// Add optional cart_id if provided
+			if cartID, ok := asString(args, "cart_id"); ok && cartID != "" {
+				arguments["cart_id"] = cartID
+			}
+
+			return storefrontMCPProxy(ctx, storeURL, "update_cart", arguments)
+		},
+	}
+}
+
+func searchShopPoliciesAndFaqsTool() tool {
+	return tool{
+		Name:        "search_shop_policies_and_faqs",
+		Description: "Answers questions about the store's policies, products, and services to build customer trust.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"store_url": map[string]any{
+					"type":        "string",
+					"description": "Shopify store URL (e.g. https://my-store.myshopify.com or https://example.com).",
+				},
+				"query": map[string]any{
+					"type":        "string",
+					"description": "The question about policies or FAQs (required)",
+				},
+				"context": map[string]any{
+					"type":        "string",
+					"description": "Additional context like current product (optional)",
+				},
+			},
+			"required":             []string{"store_url", "query"},
+			"additionalProperties": false,
+		},
+		Call: func(ctx context.Context, args map[string]any) ([]ucp.ContentItem, error) {
+			storeURL, ok := asString(args, "store_url")
+			if !ok || strings.TrimSpace(storeURL) == "" {
+				return nil, fmt.Errorf("missing required argument: store_url")
+			}
+
+			query, ok := asString(args, "query")
+			if !ok || strings.TrimSpace(query) == "" {
+				return nil, fmt.Errorf("missing required argument: query")
+			}
+
+			arguments := map[string]any{
+				"query": query,
+			}
+
+			// Add optional context if provided
+			if context, ok := asString(args, "context"); ok && context != "" {
+				arguments["context"] = context
+			}
+
+			return storefrontMCPProxy(ctx, storeURL, "search_shop_policies_and_faqs", arguments)
 		},
 	}
 }

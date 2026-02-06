@@ -4,6 +4,7 @@
 # Default substitution values
 substitutions:
   _SERVICE_ACCOUNT: ucp-service-account
+  _MCP_SERVER_URL: ''  # Set this to your MCP server URL, e.g., https://ucp-mcp-server-xxxxx.run.app
 
 steps:
   # Build and push MCP Server
@@ -54,7 +55,7 @@ steps:
       - '--set-env-vars'
       - 'UCP_REGION=ZA'
       - '--set-secrets'
-      - 'SHOPIFY_ACCESS_TOKEN=shopify-access-token:latest,OPENAI_API_KEY=openai-api-key:latest'
+      - 'SHOPIFY_CLIENT_ID=shopify-client-id:latest,SHOPIFY_CLIENT_SECRET=shopify-client-secret:latest,OPENAI_API_KEY=openai-api-key:latest'
       - '--memory'
       - '512Mi'
       - '--cpu'
@@ -80,7 +81,7 @@ steps:
       - '--service-account'
       - '${_SERVICE_ACCOUNT}@$PROJECT_ID.iam.gserviceaccount.com'
       - '--set-env-vars'
-      - 'CHAT_SERVER_ADDR=:8090,CHAT_DB_PATH=/tmp/chat_history.db'
+      - 'CHAT_SERVER_ADDR=:8090,CHAT_DB_PATH=/tmp/chat_history.db,MCP_SERVER_URL=${_MCP_SERVER_URL}'
       - '--set-secrets'
       - 'OPENAI_API_KEY=openai-api-key:latest,TWILIO_ACCOUNT_SID=twilio-account-sid:latest,TWILIO_AUTH_TOKEN=twilio-auth-token:latest,TWILIO_PHONE_NUMBER=twilio-phone-number:latest'
       - '--memory'

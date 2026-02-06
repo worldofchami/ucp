@@ -32,23 +32,42 @@ func main() {
 
 	godotenv.Load()
 
-	http_client := utils.NewHTTPClientWithBearerToken(os.Getenv("SHOPIFY_ACCESS_TOKEN"))
+	// Initialize Shopify token manager
+	var shopifyClient *shopify.Client
+	if os.Getenv("SHOPIFY_CLIENT_ID") != "" && os.Getenv("SHOPIFY_CLIENT_SECRET") != "" {
+		tokenManager, err := shopify.NewTokenManager()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error initializing token manager: %v\n", err)
+			os.Exit(1)
+		}
 
-	region := os.Getenv("UCP_REGION")
-	if strings.TrimSpace(region) == "" {
-		region = "ZA"
-	}
+		token, err := tokenManager.GetToken()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting token: %v\n", err)
+			os.Exit(1)
+		}
 
-	shopify_client := &shopify.Client{
-		HTTPClient: http_client,
-		Region:     region,
+		http_client := utils.NewHTTPClientWithBearerToken(token)
+
+		region := os.Getenv("UCP_REGION")
+		if strings.TrimSpace(region) == "" {
+			region = "ZA"
+		}
+
+		shopifyClient = &shopify.Client{
+			HTTPClient: http_client,
+			Region:     region,
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Error: SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET must be set\n")
+		os.Exit(1)
 	}
 
 	switch os.Args[1] {
 	case "discover":
 		discover(os.Args[2:])
 	case "discover-products":
-		discoverProducts(os.Args[2:], shopify_client)
+		discoverProducts(os.Args[2:], shopifyClient)
 	default:
 		usage()
 		os.Exit(2)

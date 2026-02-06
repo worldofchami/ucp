@@ -44,7 +44,7 @@ deploy-mcp:
 		--allow-unauthenticated \
 		--service-account $(SERVICE_ACCOUNT)@$(PROJECT_ID).iam.gserviceaccount.com \
 		--set-env-vars "UCP_REGION=ZA" \
-		--set-secrets "SHOPIFY_ACCESS_TOKEN=shopify-access-token:latest,OPENAI_API_KEY=openai-api-key:latest" \
+		--set-secrets "SHOPIFY_CLIENT_ID=shopify-client-id:latest,SHOPIFY_CLIENT_SECRET=shopify-client-secret:latest,OPENAI_API_KEY=openai-api-key:latest" \
 		--memory 512Mi \
 		--cpu 1
 
@@ -100,8 +100,10 @@ setup-secrets:
 	@echo "Creating secrets in Google Cloud Secret Manager..."
 	@echo "Please enter your OpenAI API Key:"
 	@read -s OPENAI_KEY && echo -n "$$OPENAI_KEY" | gcloud secrets create openai-api-key --data-file=- 2>/dev/null || echo "Secret already exists"
-	@echo "Please enter your Shopify Access Token:"
-	@read -s SHOPIFY_TOKEN && echo -n "$$SHOPIFY_TOKEN" | gcloud secrets create shopify-access-token --data-file=- 2>/dev/null || echo "Secret already exists"
+	@echo "Please enter your Shopify Client ID:"
+	@read -s SHOPIFY_CLIENT_ID && echo -n "$$SHOPIFY_CLIENT_ID" | gcloud secrets create shopify-client-id --data-file=- 2>/dev/null || echo "Secret already exists"
+	@echo "Please enter your Shopify Client Secret:"
+	@read -s SHOPIFY_CLIENT_SECRET && echo -n "$$SHOPIFY_CLIENT_SECRET" | gcloud secrets create shopify-client-secret --data-file=- 2>/dev/null || echo "Secret already exists"
 	@echo "Please enter your Twilio Account SID:"
 	@read -s TWILIO_SID && echo -n "$$TWILIO_SID" | gcloud secrets create twilio-account-sid --data-file=- 2>/dev/null || echo "Secret already exists"
 	@echo "Please enter your Twilio Auth Token:"

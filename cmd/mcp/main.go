@@ -28,11 +28,25 @@ func main() {
 		region = "ZA"
 	}
 
+	// Initialize Shopify token manager (will use env vars for client_id and client_secret)
+	var shopifyTokenManager *shopify.TokenManager
+	if os.Getenv("SHOPIFY_CLIENT_ID") != "" && os.Getenv("SHOPIFY_CLIENT_SECRET") != "" {
+		var err error
+		shopifyTokenManager, err = shopify.NewTokenManager()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to initialize Shopify token manager: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Shopify tools will not be available\n")
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Warning: SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET not set\n")
+		fmt.Fprintf(os.Stderr, "Shopify tools will not be available\n")
+	}
+
 	s := &server{
 		tools: []tool{
 			ucpDiscoverTool(),
-			shopifySearchProductsTool(region),
-			createCheckoutTool(),
+			shopifySearchProductsTool(region, shopifyTokenManager),
+			createCheckoutTool(shopifyTokenManager),
 			searchShopCatalogTool(),
 			getCartTool(),
 			updateCartTool(),
@@ -583,7 +597,7 @@ func ucpDiscoverTool() tool {
 	}
 }
 
-func shopifySearchProductsTool(region string) tool {
+func shopifySearchProductsTool(region string, tokenManager *shopify.TokenManager) tool {
 	return tool{
 		Name:        "search_products",
 		Description: "Search for products via Shopify global discovery using a natural-language query.",
@@ -612,12 +626,14 @@ func shopifySearchProductsTool(region string) tool {
 				contextSummary = ""
 			}
 
-			// Ensure environment is loaded (in case .env was updated)
-			_ = godotenv.Load()
+			// Get token from token manager (with auto-refresh)
+			if tokenManager == nil {
+				return nil, fmt.Errorf("Shopify token manager not initialized. Check SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET")
+			}
 
-			token := os.Getenv("SHOPIFY_ACCESS_TOKEN")
-			if token == "" {
-				return nil, fmt.Errorf("SHOPIFY_ACCESS_TOKEN environment variable is not set")
+			token, err := tokenManager.GetToken()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get Shopify token: %w", err)
 			}
 
 			http_client := utils.NewHTTPClientWithBearerToken(token)
@@ -661,7 +677,7 @@ func asString(args map[string]any, key string) (string, bool) {
 	return s, ok
 }
 
-func createCheckoutTool() tool {
+func createCheckoutTool(tokenManager *shopify.TokenManager) tool {
 	return tool{
 		Name:        "create_checkout",
 		Description: "Create a new checkout session at a Shopify store. Initiates checkout with line items, buyer info, and context. For Shopify stores, uses the MCP endpoint directly.",
@@ -884,10 +900,14 @@ func createCheckoutTool() tool {
 				storeURL = "https://" + storeURL
 			}
 
-			// Get Shopify access token
-			token := os.Getenv("SHOPIFY_ACCESS_TOKEN")
-			if token == "" {
-				return nil, fmt.Errorf("SHOPIFY_ACCESS_TOKEN environment variable is not set")
+			// Get token from token manager (with auto-refresh)
+			if tokenManager == nil {
+				return nil, fmt.Errorf("Shopify token manager not initialized. Check SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET")
+			}
+
+			token, err := tokenManager.GetToken()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get Shopify token: %w", err)
 			}
 
 			// Build Shopify MCP endpoint URL

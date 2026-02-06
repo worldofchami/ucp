@@ -322,30 +322,17 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[Twilio] Failed to store assistant message: %v\n", err)
 		}
 
-		// If Twilio is configured, send SMS response via API (for better control)
-		// Otherwise, use TwiML response
-		if twilioClient.IsConfigured() {
-			// Send async SMS via Twilio API
-			go func() {
-				if err := twilioClient.SendSMS(from, response); err != nil {
-					fmt.Fprintf(os.Stderr, "[Twilio] Failed to send SMS: %v\n", err)
-				} else {
-					fmt.Fprintf(os.Stderr, "[Twilio] SMS sent successfully to %s\n", from)
-				}
-			}()
-			// Return empty TwiML (we're sending via API)
-			w.Header().Set("Content-Type", "application/xml")
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><Response></Response>`))
-		} else {
-			// Send TwiML response
-			w.Header().Set("Content-Type", "application/xml")
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Message>%s</Message>
-</Response>`, escapeXML(response))
-		}
+		// Send SMS response via Twilio API
+		go func() {
+			if err := twilioClient.SendSMS(from, response); err != nil {
+				fmt.Fprintf(os.Stderr, "[Twilio] Failed to send SMS: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "[Twilio] SMS sent successfully to %s\n", from)
+			}
+		}()
+
+		// Return 200 OK to acknowledge receipt
+		w.WriteHeader(http.StatusOK)
 	})
 
 	// Main chat endpoint with context support.
@@ -474,16 +461,6 @@ func processTwilioMessage(ctx context.Context, history *MessageHistory, phoneNum
 	}
 
 	return result.FinalOutput.(string)
-}
-
-// escapeXML escapes special XML characters for Twilio
-func escapeXML(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, "\"", "&quot;")
-	s = strings.ReplaceAll(s, "'", "&apos;")
-	return s
 }
 
 // baseInstructions provides the system prompt for the shopping assistant.

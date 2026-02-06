@@ -38,8 +38,9 @@ func main() {
 			updateCartTool(),
 			searchShopPoliciesAndFaqsTool(),
 		},
-		clients: make(map[string]*sseClient),
-		mu:      &sync.RWMutex{},
+		clients:        make(map[string]*sseClient),
+		messageHistory: NewMessageHistory(10),
+		mu:             &sync.RWMutex{},
 	}
 
 	// SSE endpoint for MCP streaming
@@ -50,38 +51,34 @@ func main() {
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Cache-Control")
+		// Disable buffering for nginx/proxy compatibility
+		w.Header().Set("X-Accel-Buffering", "no")
 
 		// Generate client ID
 		clientID := r.RemoteAddr + "-" + fmt.Sprintf("%d", time.Now().UnixNano())
+		fmt.Fprintf(os.Stderr, "[SSE] New connection from %s, clientID: %s\n", r.RemoteAddr, clientID)
 
-		// Create SSE client
+		// Create SSE client with larger buffer
 		client := &sseClient{
 			id:     clientID,
 			writer: w,
-			ch:     make(chan jsonrpcResponse, 10),
+			ch:     make(chan jsonrpcResponse, 100),
 		}
 
 		s.mu.Lock()
 		s.clients[clientID] = client
+		clientCount := len(s.clients)
 		s.mu.Unlock()
+		fmt.Fprintf(os.Stderr, "[SSE] Client registered. Total clients: %d\n", clientCount)
 
 		defer func() {
 			s.mu.Lock()
 			delete(s.clients, clientID)
+			remaining := len(s.clients)
 			s.mu.Unlock()
 			close(client.ch)
+			fmt.Fprintf(os.Stderr, "[SSE] Client disconnected: %s. Remaining clients: %d\n", clientID, remaining)
 		}()
-
-		// Handle initial request from query params or body
-		if r.Method == http.MethodPost {
-			body, err := io.ReadAll(r.Body)
-			if err == nil && len(body) > 0 {
-				var msg jsonrpcRequest
-				if err := json.Unmarshal(body, &msg); err == nil {
-					go s.handleRequest(clientID, r.Context(), msg)
-				}
-			}
-		}
 
 		// Stream responses
 		flusher, ok := w.(http.Flusher)
@@ -90,21 +87,42 @@ func main() {
 			return
 		}
 
+		// Send endpoint event first (MCP protocol requirement)
+		// This tells the client where to POST messages
+		endpointURL := "/rpc"
+		if r.URL.Query().Get("sessionId") != "" {
+			endpointURL = "/rpc?sessionId=" + r.URL.Query().Get("sessionId")
+		}
+		if _, err := fmt.Fprintf(w, "event: endpoint\ndata: %s\n\n", endpointURL); err != nil {
+			fmt.Fprintf(os.Stderr, "[SSE] Failed to send endpoint event: %v\n", err)
+			return
+		}
+		flusher.Flush()
+		fmt.Fprintf(os.Stderr, "[SSE] Sent endpoint event: %s\n", endpointURL)
+
+		// Use shorter keepalive interval (15 seconds instead of 30)
+		keepaliveTicker := time.NewTicker(15 * time.Second)
+		defer keepaliveTicker.Stop()
+
 		for {
 			select {
 			case resp, ok := <-client.ch:
 				if !ok {
+					fmt.Fprintf(os.Stderr, "[SSE] Channel closed for client: %s\n", clientID)
 					return
 				}
 				if err := s.writeSSE(w, resp); err != nil {
+					fmt.Fprintf(os.Stderr, "[SSE] Write error for client %s: %v\n", clientID, err)
 					return
 				}
 				flusher.Flush()
 			case <-r.Context().Done():
+				fmt.Fprintf(os.Stderr, "[SSE] Context done for client: %s\n", clientID)
 				return
-			case <-time.After(30 * time.Second):
+			case <-keepaliveTicker.C:
 				// Send keepalive
 				if _, err := w.Write([]byte(": keepalive\n\n")); err != nil {
+					fmt.Fprintf(os.Stderr, "[SSE] Keepalive write error for client %s: %v\n", clientID, err)
 					return
 				}
 				flusher.Flush()
@@ -156,19 +174,138 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	// Twilio webhook endpoint for receiving SMS messages
+	http.HandleFunc("/twilio/webhook", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse Twilio webhook payload
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "Invalid form data", http.StatusBadRequest)
+			return
+		}
+
+		from := r.FormValue("From")
+		body := r.FormValue("Body")
+
+		if from == "" || body == "" {
+			http.Error(w, "Missing From or Body", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Fprintf(os.Stderr, "[Twilio] Received message from %s: %s\n", from, body)
+
+		// Store user message in history
+		s.messageHistory.AddMessage(from, Message{
+			Role:        "user",
+			Content:     body,
+			Timestamp:   time.Now(),
+			PhoneNumber: from,
+		})
+
+		// Process the message with context
+		response := s.processTwilioMessage(r.Context(), from, body)
+
+		// Store assistant response in history
+		s.messageHistory.AddMessage(from, Message{
+			Role:        "assistant",
+			Content:     response,
+			Timestamp:   time.Now(),
+			PhoneNumber: from,
+		})
+
+		// Send TwiML response
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Message>%s</Message>
+</Response>`, escapeXML(response))
+	})
+
 	addr := ":8080"
 	fmt.Fprintf(os.Stderr, "ucp-mcp SSE server listening on %s\n", addr)
 	fmt.Fprintf(os.Stderr, "SSE endpoint: http://localhost%s/sse\n", addr)
+	fmt.Fprintf(os.Stderr, "Twilio webhook: http://localhost%s/twilio/webhook\n", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
+// Message represents a chat message
+type Message struct {
+	Role        string    `json:"role"` // "user" or "assistant"
+	Content     string    `json:"content"`
+	Timestamp   time.Time `json:"timestamp"`
+	PhoneNumber string    `json:"phone_number,omitempty"` // For Twilio integration
+}
+
+// MessageHistory stores the last N messages per conversation
+type MessageHistory struct {
+	messages map[string][]Message // key: phone number
+	mu       sync.RWMutex
+	maxSize  int
+}
+
+func NewMessageHistory(maxSize int) *MessageHistory {
+	return &MessageHistory{
+		messages: make(map[string][]Message),
+		maxSize:  maxSize,
+	}
+}
+
+func (mh *MessageHistory) AddMessage(phoneNumber string, msg Message) {
+	mh.mu.Lock()
+	defer mh.mu.Unlock()
+
+	mh.messages[phoneNumber] = append(mh.messages[phoneNumber], msg)
+
+	// Keep only last maxSize messages
+	if len(mh.messages[phoneNumber]) > mh.maxSize {
+		mh.messages[phoneNumber] = mh.messages[phoneNumber][len(mh.messages[phoneNumber])-mh.maxSize:]
+	}
+}
+
+func (mh *MessageHistory) GetHistory(phoneNumber string) []Message {
+	mh.mu.RLock()
+	defer mh.mu.RUnlock()
+
+	if msgs, ok := mh.messages[phoneNumber]; ok {
+		// Return a copy
+		result := make([]Message, len(msgs))
+		copy(result, msgs)
+		return result
+	}
+	return []Message{}
+}
+
+func (mh *MessageHistory) GetHistoryAsContext(phoneNumber string) string {
+	msgs := mh.GetHistory(phoneNumber)
+	if len(msgs) == 0 {
+		return ""
+	}
+
+	var context strings.Builder
+	context.WriteString("\n\n=== Recent Conversation History ===\n")
+	for _, msg := range msgs {
+		role := "User"
+		if msg.Role == "assistant" {
+			role = "Assistant"
+		}
+		context.WriteString(fmt.Sprintf("%s: %s\n", role, msg.Content))
+	}
+	context.WriteString("=== End of History ===\n")
+	return context.String()
+}
+
 type server struct {
-	tools   []tool
-	clients map[string]*sseClient
-	mu      *sync.RWMutex
+	tools          []tool
+	clients        map[string]*sseClient
+	messageHistory *MessageHistory
+	mu             *sync.RWMutex
 }
 
 type sseClient struct {
@@ -260,6 +397,30 @@ func (s *server) handleToolsList(req jsonrpcRequest) jsonrpcResponse {
 	})
 }
 
+// processTwilioMessage processes a message from Twilio with context
+func (s *server) processTwilioMessage(ctx context.Context, phoneNumber, message string) string {
+	// Get conversation history for context
+	history := s.messageHistory.GetHistoryAsContext(phoneNumber)
+
+	// For now, return a simple response
+	// In production, this would call an LLM or process through available tools
+	if history != "" {
+		return fmt.Sprintf("I received your message: %s\n\n(Processing with %d messages of context including conversation history)", message, len(s.messageHistory.GetHistory(phoneNumber)))
+	}
+
+	return fmt.Sprintf("I received your message: %s", message)
+}
+
+// escapeXML escapes special XML characters
+func escapeXML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	s = strings.ReplaceAll(s, "'", "&apos;")
+	return s
+}
+
 func (s *server) handleToolsCall(ctx context.Context, req jsonrpcRequest) jsonrpcResponse {
 	var p toolsCallParams
 	if err := json.Unmarshal(req.Params, &p); err != nil {
@@ -286,6 +447,15 @@ func (s *server) handleToolsCall(ctx context.Context, req jsonrpcRequest) jsonrp
 			"reason": "unknown tool",
 			"name":   p.Name,
 		})
+	}
+
+	// Check if phone_number is in arguments and add context
+	if phoneNumber, ok := p.Arguments["phone_number"].(string); ok && phoneNumber != "" {
+		history := s.messageHistory.GetHistoryAsContext(phoneNumber)
+		if history != "" {
+			// Add context to arguments
+			p.Arguments["conversation_context"] = history
+		}
 	}
 
 	content, err := t.Call(ctx, p.Arguments)
@@ -1092,8 +1262,48 @@ func updateCartTool() tool {
 				return nil, fmt.Errorf("missing required argument: add_items (must be a non-empty array)")
 			}
 
+			// Transform items from agent format (item.id) to Storefront MCP format (product_variant_id)
+			transformedItems := make([]map[string]any, 0, len(addItems))
+			for _, item := range addItems {
+				itemMap, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+
+				transformedItem := make(map[string]any)
+
+				// Extract quantity
+				if qty, ok := itemMap["quantity"].(float64); ok {
+					transformedItem["quantity"] = int(qty)
+				}
+
+				// Handle both formats: item.id (from agent) and product_variant_id (direct)
+				if itemObj, ok := itemMap["item"].(map[string]any); ok {
+					// Format from agent: {"item": {"id": "..."}, "quantity": 1}
+					if id, ok := asString(itemObj, "id"); ok && id != "" {
+						transformedItem["product_variant_id"] = id
+					}
+				} else if variantID, ok := asString(itemMap, "product_variant_id"); ok && variantID != "" {
+					// Direct format: {"product_variant_id": "...", "quantity": 1}
+					transformedItem["product_variant_id"] = variantID
+				}
+
+				// Add line_item_id if present
+				if lineItemID, ok := asString(itemMap, "line_item_id"); ok && lineItemID != "" {
+					transformedItem["line_item_id"] = lineItemID
+				}
+
+				if len(transformedItem) > 0 {
+					transformedItems = append(transformedItems, transformedItem)
+				}
+			}
+
+			if len(transformedItems) == 0 {
+				return nil, fmt.Errorf("no valid items to add to cart")
+			}
+
 			arguments := map[string]any{
-				"add_items": addItems,
+				"add_items": transformedItems,
 			}
 
 			// Add optional cart_id if provided

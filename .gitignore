@@ -12,3 +12,7 @@ logs
 .DS_Store
 
 examples
+
+*.db
+
+cmd/server/*.md

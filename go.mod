@@ -17,6 +17,7 @@ require (
 	github.com/go-audio/audio v1.0.0 // indirect
 	github.com/go-audio/riff v1.0.0 // indirect
 	github.com/go-audio/wav v1.1.0 // indirect
+	github.com/golang/mock v1.6.0 // indirect
 	github.com/google/jsonschema-go v0.2.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
@@ -31,6 +32,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.32 // indirect
 	github.com/modelcontextprotocol/go-sdk v0.5.0 // indirect
 	github.com/openai/openai-go/v2 v2.5.0 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect
 	github.com/tidwall/match v1.2.0 // indirect

@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    ports:
+      - "8080:8080"
+    environment:
+      - UCP_REGION=${UCP_REGION:-ZA}
+      - SHOPIFY_ACCESS_TOKEN=${SHOPIFY_ACCESS_TOKEN}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./logs:/root/logs
+    networks:
+      - ucp-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  chat-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.chat
+    ports:
+      - "8090:8090"
+    environment:
+      - CHAT_SERVER_ADDR=:8090
+      - CHAT_DB_PATH=/root/data/chat_history.db
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - chat-data:/root/data
+    networks:
+      - ucp-network
+    depends_on:
+      - mcp-server
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8090/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  chat-data:
+
+networks:
+  ucp-network:
+    driver: bridge

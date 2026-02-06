@@ -1,0 +1,39 @@
+# Dockerfile for Chat Server
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /app
+
+# Install dependencies including gcc and sqlite dev libraries for CGO
+RUN apk add --no-cache git gcc musl-dev sqlite-dev
+
+# Copy go mod files
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the chat server with CGO enabled for SQLite
+RUN CGO_ENABLED=1 GOOS=linux go build -a -o chat-server ./cmd/server
+
+# Final stage
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates sqlite-libs
+
+WORKDIR /root/
+
+# Copy the binary from builder
+COPY --from=builder /app/chat-server .
+
+# Create directory for SQLite database
+RUN mkdir -p /root/data
+
+# Expose port
+EXPOSE 8090
+
+# Set environment variable for database path
+ENV CHAT_DB_PATH=/root/data/chat_history.db
+
+# Run the server
+CMD ["./chat-server"]

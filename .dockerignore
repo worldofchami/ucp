@@ -1,0 +1,55 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+*.md
+DEPLOYMENT.md
+README.md
+
+# Local environment
+.env
+.env.example
+.env.local
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Build artifacts
+bin/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test files
+*_test.go
+vendor/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile*
+docker-compose.yml
+.dockerignore
+
+# Cloud Build
+cloudbuild.yaml
+
+# Misc
+TODO.md

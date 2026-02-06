@@ -1,0 +1,98 @@
+# Simple Cloud Build Configuration (no git trigger required)
+# Use this for manual deployments from local machine
+
+# Default substitution values
+substitutions:
+  _SERVICE_ACCOUNT: ucp-service-account
+
+steps:
+  # Build and push MCP Server
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.mcp'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/ucp-mcp-server:latest'
+      - '.'
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/ucp-mcp-server:latest'
+
+  # Build and push Chat Server
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.chat'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/ucp-chat-server:latest'
+      - '.'
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/ucp-chat-server:latest'
+
+  # Deploy MCP Server to Cloud Run
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'ucp-mcp-server'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/ucp-mcp-server:latest'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--port'
+      - '8080'
+      - '--allow-unauthenticated'
+      - '--service-account'
+      - '${_SERVICE_ACCOUNT}@$PROJECT_ID.iam.gserviceaccount.com'
+      - '--set-env-vars'
+      - 'UCP_REGION=ZA'
+      - '--set-secrets'
+      - 'SHOPIFY_ACCESS_TOKEN=shopify-access-token:latest,OPENAI_API_KEY=openai-api-key:latest'
+      - '--memory'
+      - '512Mi'
+      - '--cpu'
+      - '1'
+      - '--max-instances'
+      - '10'
+
+  # Deploy Chat Server to Cloud Run
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'ucp-chat-server'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/ucp-chat-server:latest'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--port'
+      - '8090'
+      - '--allow-unauthenticated'
+      - '--service-account'
+      - '${_SERVICE_ACCOUNT}@$PROJECT_ID.iam.gserviceaccount.com'
+      - '--set-env-vars'
+      - 'CHAT_SERVER_ADDR=:8090,CHAT_DB_PATH=/tmp/chat_history.db'
+      - '--set-secrets'
+      - 'OPENAI_API_KEY=openai-api-key:latest,TWILIO_ACCOUNT_SID=twilio-account-sid:latest,TWILIO_AUTH_TOKEN=twilio-auth-token:latest,TWILIO_PHONE_NUMBER=twilio-phone-number:latest'
+      - '--memory'
+      - '512Mi'
+      - '--cpu'
+      - '1'
+      - '--max-instances'
+      - '10'
+
+images:
+  - 'gcr.io/$PROJECT_ID/ucp-mcp-server:latest'
+  - 'gcr.io/$PROJECT_ID/ucp-chat-server:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

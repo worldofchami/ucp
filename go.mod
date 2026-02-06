@@ -6,6 +6,7 @@ require (
 	github.com/go-chi/chi/v5 v5.2.4
 	github.com/joho/godotenv v1.5.1
 	github.com/nlpodyssey/openai-agents-go v0.1.0
+	github.com/twilio/twilio-go v1.23.9
 	gorm.io/driver/sqlite v1.6.0
 	gorm.io/gorm v1.31.1
 )

@@ -16,3 +16,7 @@ examples
 *.db
 
 cmd/server/*.md
+
+*.md
+!README.md
+!TODO.md

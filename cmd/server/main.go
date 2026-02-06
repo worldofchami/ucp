@@ -15,6 +15,8 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/nlpodyssey/openai-agents-go/agents"
 	"github.com/nlpodyssey/openai-agents-go/tracing"
+	"github.com/twilio/twilio-go"
+	openapi "github.com/twilio/twilio-go/rest/api/v2010"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -180,6 +182,62 @@ func (mh *MessageHistory) GetHistoryAsContext(conversationID string) (string, er
 	return context.String(), nil
 }
 
+// TwilioClient handles SMS sending via Twilio
+type TwilioClient struct {
+	client      *twilio.RestClient
+	phoneNumber string
+	configured  bool
+}
+
+// NewTwilioClient creates a new Twilio client from environment variables
+func NewTwilioClient() *TwilioClient {
+	accountSID := os.Getenv("TWILIO_ACCOUNT_SID")
+	authToken := os.Getenv("TWILIO_AUTH_TOKEN")
+	phoneNumber := os.Getenv("TWILIO_PHONE_NUMBER")
+
+	if accountSID == "" || authToken == "" || phoneNumber == "" {
+		return &TwilioClient{
+			configured: false,
+		}
+	}
+
+	client := twilio.NewRestClientWithParams(twilio.ClientParams{
+		Username: accountSID,
+		Password: authToken,
+	})
+
+	return &TwilioClient{
+		client:      client,
+		phoneNumber: phoneNumber,
+		configured:  true,
+	}
+}
+
+// IsConfigured returns true if the client is properly configured
+func (t *TwilioClient) IsConfigured() bool {
+	return t.configured
+}
+
+// SendSMS sends an SMS message to the specified phone number
+func (t *TwilioClient) SendSMS(toPhoneNumber, message string) error {
+	if !t.configured {
+		return fmt.Errorf("twilio client not configured")
+	}
+
+	params := &openapi.CreateMessageParams{
+		To:   &toPhoneNumber,
+		From: &t.phoneNumber,
+		Body: &message,
+	}
+
+	_, err := t.client.Api.CreateMessage(params)
+	if err != nil {
+		return fmt.Errorf("failed to send SMS: %w", err)
+	}
+
+	return nil
+}
+
 // chatRequest is the payload accepted by the /chat endpoint.
 type chatRequest struct {
 	Prompt string `json:"prompt"`
@@ -206,6 +264,14 @@ func main() {
 		os.Exit(1)
 	}
 	defer messageHistory.Close()
+
+	// Initialize Twilio client
+	twilioClient := NewTwilioClient()
+	if twilioClient.IsConfigured() {
+		fmt.Fprintf(os.Stderr, "Twilio client initialized\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "Warning: Twilio not configured (set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER)\n")
+	}
 
 	r := chi.NewRouter()
 
@@ -256,13 +322,30 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[Twilio] Failed to store assistant message: %v\n", err)
 		}
 
-		// Send TwiML response
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
+		// If Twilio is configured, send SMS response via API (for better control)
+		// Otherwise, use TwiML response
+		if twilioClient.IsConfigured() {
+			// Send async SMS via Twilio API
+			go func() {
+				if err := twilioClient.SendSMS(from, response); err != nil {
+					fmt.Fprintf(os.Stderr, "[Twilio] Failed to send SMS: %v\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "[Twilio] SMS sent successfully to %s\n", from)
+				}
+			}()
+			// Return empty TwiML (we're sending via API)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><Response></Response>`))
+		} else {
+			// Send TwiML response
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Message>%s</Message>
 </Response>`, escapeXML(response))
+		}
 	})
 
 	// Main chat endpoint with context support.
@@ -429,7 +512,12 @@ func getEnv(key, def string) string {
 
 // --- MCP integration helpers ------------------------------------------------
 
-const mcpServerURL = "http://localhost:8080/rpc"
+func getMCPServerURL() string {
+	if url := os.Getenv("MCP_SERVER_URL"); url != "" {
+		return url + "/rpc"
+	}
+	return "http://localhost:8080/rpc"
+}
 
 // mcpDiscoverStoreParams is the parameter shape for the discover-store tool.
 type mcpDiscoverStoreParams struct {
@@ -502,7 +590,7 @@ func callMCP(ctx context.Context, toolName string, args map[string]interface{}) 
 		return "", fmt.Errorf("marshal MCP request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, mcpServerURL, bytes.NewReader(b))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, getMCPServerURL(), bytes.NewReader(b))
 	if err != nil {
 		return "", fmt.Errorf("build MCP request: %w", err)
 	}

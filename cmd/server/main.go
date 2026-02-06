@@ -218,15 +218,33 @@ func (t *TwilioClient) IsConfigured() bool {
 	return t.configured
 }
 
+// GetPhoneNumber returns the configured Twilio phone number
+func (t *TwilioClient) GetPhoneNumber() string {
+	return t.phoneNumber
+}
+
 // SendSMS sends an SMS message to the specified phone number
 func (t *TwilioClient) SendSMS(toPhoneNumber, message string) error {
 	if !t.configured {
 		return fmt.Errorf("twilio client not configured")
 	}
 
+	// Format phone numbers - ensure they have + prefix
+	toPhoneNumber = formatPhoneNumber(toPhoneNumber)
+	fromPhoneNumber := formatPhoneNumber(t.phoneNumber)
+
+	// Truncate message if exceeds Twilio limit (1600 chars)
+	const maxLength = 1600
+	if len(message) > maxLength {
+		fmt.Fprintf(os.Stderr, "[Twilio] Warning: Message exceeds %d characters, truncating...\n", maxLength)
+		message = message[:maxLength-3] + "..."
+	}
+
+	fmt.Fprintf(os.Stderr, "[Twilio] Sending SMS from %s to %s (length: %d)\n", fromPhoneNumber, toPhoneNumber, len(message))
+
 	params := &openapi.CreateMessageParams{
 		To:   &toPhoneNumber,
-		From: &t.phoneNumber,
+		From: &fromPhoneNumber,
 		Body: &message,
 	}
 
@@ -238,6 +256,30 @@ func (t *TwilioClient) SendSMS(toPhoneNumber, message string) error {
 	return nil
 }
 
+// formatPhoneNumber ensures phone number has proper E.164 format (+ prefix)
+func formatPhoneNumber(phone string) string {
+	phone = strings.TrimSpace(phone)
+	// Remove any non-numeric characters except +
+	var result strings.Builder
+	for _, char := range phone {
+		if char >= '0' && char <= '9' || char == '+' {
+			result.WriteRune(char)
+		}
+	}
+	phone = result.String()
+
+	// Add + prefix if missing
+	if !strings.HasPrefix(phone, "+") {
+		phone = "+" + phone
+	}
+
+	if !strings.HasPrefix(phone, "whatsapp:") {
+		phone = "whatsapp:" + phone
+	}
+
+	return phone
+}
+
 // chatRequest is the payload accepted by the /chat endpoint.
 type chatRequest struct {
 	Prompt string `json:"prompt"`
@@ -246,6 +288,47 @@ type chatRequest struct {
 // chatResponse is the JSON shape returned by the /chat endpoint.
 type chatResponse struct {
 	Output string `json:"output"`
+}
+
+// ConversationContext holds context for a conversation including SMS capabilities
+type ConversationContext struct {
+	PhoneNumber    string
+	TwilioClient   *TwilioClient
+	MessageHistory *MessageHistory
+}
+
+// SendSMSParams parameters for sending SMS
+type SendSMSParams struct {
+	Message string `json:"message"`
+}
+
+// sendSMSTool creates a tool that allows the agent to send SMS messages
+func sendSMSTool(ctx *ConversationContext) agents.FunctionTool {
+	return agents.NewFunctionTool(
+		"send_sms",
+		"Send an SMS message to the user. Use this to send product information, updates, or any message to the user. Each product should be sent as a separate message.",
+		func(_ context.Context, params SendSMSParams) (string, error) {
+			if ctx.TwilioClient == nil || !ctx.TwilioClient.IsConfigured() {
+				return "", fmt.Errorf("SMS not available - Twilio not configured")
+			}
+
+			if err := ctx.TwilioClient.SendSMS(ctx.PhoneNumber, params.Message); err != nil {
+				return "", fmt.Errorf("failed to send SMS: %w", err)
+			}
+
+			// Store the sent message in history
+			if ctx.MessageHistory != nil {
+				_ = ctx.MessageHistory.AddMessage(ctx.PhoneNumber, Message{
+					Role:        "assistant",
+					Content:     params.Message,
+					Timestamp:   time.Now(),
+					PhoneNumber: ctx.PhoneNumber,
+				})
+			}
+
+			return "SMS sent successfully", nil
+		},
+	)
 }
 
 func main() {
@@ -297,39 +380,45 @@ func main() {
 			return
 		}
 
-		fmt.Fprintf(os.Stderr, "[Twilio] Received message from %s: %s\n", from, body)
+		// Format the from number for consistency
+		fromFormatted := formatPhoneNumber(from)
+		fmt.Fprintf(os.Stderr, "[Twilio] Received message from %s (formatted: %s): %s\n", from, fromFormatted, body)
+		fmt.Fprintf(os.Stderr, "[Twilio] Configured Twilio phone number: %s\n", formatPhoneNumber(twilioClient.GetPhoneNumber()))
 
 		// Store user message in history
-		if err := messageHistory.AddMessage(from, Message{
+		if err := messageHistory.AddMessage(fromFormatted, Message{
 			Role:        "user",
 			Content:     body,
 			Timestamp:   time.Now(),
-			PhoneNumber: from,
+			PhoneNumber: fromFormatted,
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "[Twilio] Failed to store user message: %v\n", err)
 		}
 
 		// Process the message with context
-		response := processTwilioMessage(r.Context(), messageHistory, from, body)
+		// The agent will handle sending SMS messages for products using the send_sms tool
+		response := processTwilioMessage(r.Context(), messageHistory, twilioClient, fromFormatted, body)
 
-		// Store assistant response in history
-		if err := messageHistory.AddMessage(from, Message{
-			Role:        "assistant",
-			Content:     response,
-			Timestamp:   time.Now(),
-			PhoneNumber: from,
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "[Twilio] Failed to store assistant message: %v\n", err)
-		}
-
-		// Send SMS response via Twilio API
-		go func() {
-			if err := twilioClient.SendSMS(from, response); err != nil {
-				fmt.Fprintf(os.Stderr, "[Twilio] Failed to send SMS: %v\n", err)
-			} else {
-				fmt.Fprintf(os.Stderr, "[Twilio] SMS sent successfully to %s\n", from)
+		// Store final response in history
+		if response != "" {
+			if err := messageHistory.AddMessage(fromFormatted, Message{
+				Role:        "assistant",
+				Content:     response,
+				Timestamp:   time.Now(),
+				PhoneNumber: fromFormatted,
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "[Twilio] Failed to store assistant message: %v\n", err)
 			}
-		}()
+
+			// Send final response via Twilio API
+			go func() {
+				if err := twilioClient.SendSMS(fromFormatted, response); err != nil {
+					fmt.Fprintf(os.Stderr, "[Twilio] Failed to send SMS: %v\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "[Twilio] SMS sent successfully to %s\n", fromFormatted)
+				}
+			}()
+		}
 
 		// Return 200 OK to acknowledge receipt
 		w.WriteHeader(http.StatusOK)
@@ -423,7 +512,14 @@ func main() {
 }
 
 // processTwilioMessage processes a message from Twilio with context
-func processTwilioMessage(ctx context.Context, history *MessageHistory, phoneNumber, message string) string {
+func processTwilioMessage(ctx context.Context, history *MessageHistory, twilioClient *TwilioClient, phoneNumber, message string) string {
+	// Create conversation context
+	convCtx := &ConversationContext{
+		PhoneNumber:    phoneNumber,
+		TwilioClient:   twilioClient,
+		MessageHistory: history,
+	}
+
 	// Get conversation history for context
 	conversationContext, err := history.GetHistoryAsContext(phoneNumber)
 	if err != nil {
@@ -437,7 +533,7 @@ func processTwilioMessage(ctx context.Context, history *MessageHistory, phoneNum
 		promptWithContext = message + conversationContext
 	}
 
-	// Build a shopping-assistant agent
+	// Build a shopping-assistant agent with SMS capability
 	agent := agents.New("ShoppingAssistant").
 		WithInstructions(baseInstructions()).
 		WithModel("gpt-4o").
@@ -449,6 +545,7 @@ func processTwilioMessage(ctx context.Context, history *MessageHistory, phoneNum
 			mcpUpdateCartTool(),
 			mcpCreateCheckoutTool(),
 			mcpSearchShopPoliciesTool(),
+			sendSMSTool(convCtx),
 		)
 
 	// Run the agent
@@ -470,12 +567,24 @@ You are a **personal shopping assistant**.
 
 Your goal is to help customers discover and compare products that best match what they are looking for.
 
+SMS PRODUCT MESSAGING WORKFLOW:
+When you find products for a user, you MUST send each product as a separate SMS message:
+1. Search for products using search_products or search_shop_catalog tools
+2. For EACH product found (maximum 3 products), send a separate SMS using the send_sms tool
+3. Format each product message as: "Product: [Name] - [Price] - [URL]"
+4. After sending all product messages, provide a brief summary in your final response
+
+IMPORTANT RULES:
+- Send AT MOST 3 products total
+- Each product gets its OWN SMS message via send_sms tool
+- ALWAYS include the product URL in each message so users can view it
+- Keep each SMS under 1600 characters
+- Send product messages immediately after finding them, don't wait
+
 Guidelines:
 - Ask brief clarification questions when the request is ambiguous.
 - Use the available tools to discover stores and search for products rather than guessing.
-- When showing products, summarize key attributes (price range, style, color, size options, shipping region).
-- When appropriate, suggest a small, curated set of options instead of an exhaustive list.
-- Always explain *why* a product is a good fit for the customer's request.
+- When showing products, summarize key attributes briefly (price range, style).
 `)
 }
 

@@ -33,7 +33,7 @@ func (client *Client) DiscoverProducts(query string, context string) ([]models.P
 		"arguments": map[string]any{
 			"query":    query,
 			"context":  context,
-			"limit":    10,
+			"limit":    3,
 			"ships_to": region,
 		},
 	})

@@ -32,6 +32,21 @@ type Message struct {
 	PhoneNumber    string    `json:"phone_number,omitempty"` // For Twilio integration
 }
 
+// User represents a user in the system
+type User struct {
+	ID              int64     `json:"id"`
+	PhoneNumber     string    `json:"phone_number"`
+	Name            string    `json:"name"`
+	Email           string    `json:"email"`
+	StreetAddress   string    `json:"street_address"`
+	AddressLocality string    `json:"address_locality"`
+	AddressRegion   string    `json:"address_region"`
+	PostalCode      string    `json:"postal_code"`
+	AddressCountry  string    `json:"address_country"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
 // MessageHistory stores messages using GORM with raw SQL queries
 type MessageHistory struct {
 	db      *gorm.DB
@@ -50,8 +65,23 @@ func NewMessageHistory(dbPath string, maxSize int) (*MessageHistory, error) {
 
 	// Execute schema from SQL file
 	schemaSQL := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		phone_number TEXT UNIQUE NOT NULL,
+		name TEXT,
+		email TEXT,
+		street_address TEXT,
+		address_locality TEXT,
+		address_region TEXT,
+		postal_code TEXT,
+		address_country TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
 	CREATE TABLE IF NOT EXISTS conversations (
 		id TEXT PRIMARY KEY,
+		user_id TEXT REFERENCES users(id),
 		phone_number TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -68,6 +98,7 @@ func NewMessageHistory(dbPath string, maxSize int) (*MessageHistory, error) {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
+	CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone_number);
 	`
 
 	if err := db.Exec(schemaSQL).Error; err != nil {
@@ -182,6 +213,89 @@ func (mh *MessageHistory) GetHistoryAsContext(conversationID string) (string, er
 	return context.String(), nil
 }
 
+// GetOrCreateUser gets an existing user by phone number or creates a new one
+func (mh *MessageHistory) GetOrCreateUser(phoneNumber string) (*User, error) {
+	mh.mu.Lock()
+	defer mh.mu.Unlock()
+
+	// Try to get existing user
+	var user User
+	query := `SELECT id, phone_number, name, email, street_address, address_locality, address_region, postal_code, address_country, created_at, updated_at FROM users WHERE phone_number = ?`
+	row := mh.db.Raw(query, phoneNumber).Row()
+	err := row.Scan(&user.ID, &user.PhoneNumber, &user.Name, &user.Email, &user.StreetAddress, &user.AddressLocality, &user.AddressRegion, &user.PostalCode, &user.AddressCountry, &user.CreatedAt, &user.UpdatedAt)
+
+	if err == nil {
+		return &user, nil
+	}
+
+	// Create new user if not found
+	userID := fmt.Sprintf("user_%d", time.Now().UnixNano())
+	insertQuery := `
+		INSERT INTO users (id, phone_number, name, email, street_address, address_locality, address_region, postal_code, address_country, created_at, updated_at)
+		VALUES (?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, datetime('now'), datetime('now'))`
+
+	if err := mh.db.Exec(insertQuery, userID, phoneNumber).Error; err != nil {
+		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+
+	// Return the newly created user
+	user = User{
+		ID:          0, // Will be populated on next query
+		PhoneNumber: phoneNumber,
+		Name:        "",
+	}
+	return &user, nil
+}
+
+// GetUserByPhone gets a user by phone number
+func (mh *MessageHistory) GetUserByPhone(phoneNumber string) (*User, error) {
+	mh.mu.RLock()
+	defer mh.mu.RUnlock()
+
+	var user User
+	query := `SELECT id, phone_number, name, email, street_address, address_locality, address_region, postal_code, address_country, created_at, updated_at FROM users WHERE phone_number = ?`
+	row := mh.db.Raw(query, phoneNumber).Row()
+	err := row.Scan(&user.ID, &user.PhoneNumber, &user.Name, &user.Email, &user.StreetAddress, &user.AddressLocality, &user.AddressRegion, &user.PostalCode, &user.AddressCountry, &user.CreatedAt, &user.UpdatedAt)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+// UpdateUserField updates a specific user field
+func (mh *MessageHistory) UpdateUserField(phoneNumber, field, value string) error {
+	mh.mu.Lock()
+	defer mh.mu.Unlock()
+
+	// Validate field name to prevent SQL injection
+	validFields := map[string]bool{
+		"name":             true,
+		"email":            true,
+		"street_address":   true,
+		"address_locality": true,
+		"address_region":   true,
+		"postal_code":      true,
+		"address_country":  true,
+	}
+
+	if !validFields[field] {
+		return fmt.Errorf("invalid field name: %s", field)
+	}
+
+	query := fmt.Sprintf(`
+		UPDATE users 
+		SET %s = ?, updated_at = datetime('now')
+		WHERE phone_number = ?`, field)
+
+	if err := mh.db.Exec(query, value, phoneNumber).Error; err != nil {
+		return fmt.Errorf("failed to update user field %s: %w", field, err)
+	}
+
+	return nil
+}
+
 // TwilioClient handles SMS sending via Twilio
 type TwilioClient struct {
 	client      *twilio.RestClient
@@ -223,8 +337,8 @@ func (t *TwilioClient) GetPhoneNumber() string {
 	return t.phoneNumber
 }
 
-// SendSMS sends an SMS message to the specified phone number
-func (t *TwilioClient) SendSMS(toPhoneNumber, message string) error {
+// SendSMS sends an SMS or MMS message to the specified phone number
+func (t *TwilioClient) SendSMS(toPhoneNumber, message, imageURL string) error {
 	if !t.configured {
 		return fmt.Errorf("twilio client not configured")
 	}
@@ -240,12 +354,21 @@ func (t *TwilioClient) SendSMS(toPhoneNumber, message string) error {
 		message = message[:maxLength-3] + "..."
 	}
 
-	fmt.Fprintf(os.Stderr, "[Twilio] Sending SMS from %s to %s (length: %d)\n", fromPhoneNumber, toPhoneNumber, len(message))
+	if imageURL != "" {
+		fmt.Fprintf(os.Stderr, "[Twilio] Sending MMS from %s to %s with image (length: %d)\n", fromPhoneNumber, toPhoneNumber, len(message))
+	} else {
+		fmt.Fprintf(os.Stderr, "[Twilio] Sending SMS from %s to %s (length: %d)\n", fromPhoneNumber, toPhoneNumber, len(message))
+	}
 
 	params := &openapi.CreateMessageParams{
 		To:   &toPhoneNumber,
 		From: &fromPhoneNumber,
 		Body: &message,
+	}
+
+	// Add image if provided (MMS)
+	if imageURL != "" {
+		params.SetMediaUrl([]string{imageURL})
 	}
 
 	_, err := t.client.Api.CreateMessage(params)
@@ -293,40 +416,77 @@ type chatResponse struct {
 // ConversationContext holds context for a conversation including SMS capabilities
 type ConversationContext struct {
 	PhoneNumber    string
+	UserName       string
 	TwilioClient   *TwilioClient
 	MessageHistory *MessageHistory
 }
 
-// SendSMSParams parameters for sending SMS
+// SendSMSParams parameters for sending SMS/MMS
 type SendSMSParams struct {
-	Message string `json:"message"`
+	Message  string `json:"message"`
+	ImageURL string `json:"image_url,omitempty"`
 }
 
-// sendSMSTool creates a tool that allows the agent to send SMS messages
+// UpdateUserFieldParams parameters for updating user fields
+type UpdateUserFieldParams struct {
+	Field string `json:"field"`
+	Value string `json:"value"`
+}
+
+// sendSMSTool creates a tool that allows the agent to send SMS/MMS messages
 func sendSMSTool(ctx *ConversationContext) agents.FunctionTool {
 	return agents.NewFunctionTool(
 		"send_sms",
-		"Send an SMS message to the user. Use this to send product information, updates, or any message to the user. Each product should be sent as a separate message.",
+		"Send an SMS or MMS message to the user. Use this to send product information with images. Each product should be sent as a separate message. Include the product image URL when available for a richer experience.",
 		func(_ context.Context, params SendSMSParams) (string, error) {
 			if ctx.TwilioClient == nil || !ctx.TwilioClient.IsConfigured() {
 				return "", fmt.Errorf("SMS not available - Twilio not configured")
 			}
 
-			if err := ctx.TwilioClient.SendSMS(ctx.PhoneNumber, params.Message); err != nil {
+			if err := ctx.TwilioClient.SendSMS(ctx.PhoneNumber, params.Message, params.ImageURL); err != nil {
 				return "", fmt.Errorf("failed to send SMS: %w", err)
 			}
 
 			// Store the sent message in history
 			if ctx.MessageHistory != nil {
+				content := params.Message
+				if params.ImageURL != "" {
+					content += " [Image: " + params.ImageURL + "]"
+				}
 				_ = ctx.MessageHistory.AddMessage(ctx.PhoneNumber, Message{
 					Role:        "assistant",
-					Content:     params.Message,
+					Content:     content,
 					Timestamp:   time.Now(),
 					PhoneNumber: ctx.PhoneNumber,
 				})
 			}
 
 			return "SMS sent successfully", nil
+		},
+	)
+}
+
+// updateUserFieldTool creates a tool that allows the agent to update any user field
+func updateUserFieldTool(ctx *ConversationContext) agents.FunctionTool {
+	return agents.NewFunctionTool(
+		"update_user_field",
+		"Update any user information field. Valid fields are: name, email, street_address, address_locality, address_region, postal_code, address_country. Use this whenever the user provides personal information.",
+		func(_ context.Context, params UpdateUserFieldParams) (string, error) {
+			if ctx.MessageHistory == nil {
+				return "", fmt.Errorf("message history not available")
+			}
+
+			if err := ctx.MessageHistory.UpdateUserField(ctx.PhoneNumber, params.Field, params.Value); err != nil {
+				return "", fmt.Errorf("failed to update user field: %w", err)
+			}
+
+			// Update context if name was changed
+			if params.Field == "name" {
+				ctx.UserName = params.Value
+				return fmt.Sprintf("Got it! Nice to meet you, %s! ðŸ˜Š", params.Value), nil
+			}
+
+			return fmt.Sprintf("Updated your %s. Thanks! ðŸ‘�", params.Field), nil
 		},
 	)
 }
@@ -375,6 +535,28 @@ func main() {
 		from := r.FormValue("From")
 		body := r.FormValue("Body")
 
+		// Check if this is a reply to a specific message (WhatsApp reply-to feature)
+		// Twilio sends the original message SID in various possible fields
+		originalMessageSid := ""
+		possibleFields := []string{
+			"OriginalRepliedMessageSid", // Primary field for WhatsApp reply-to
+			"RepliedMessageSid",         // Alternative field name
+			"QuotedMessageSid",          // Another possible field
+			"Context",                   // May contain reply context
+			"MessageSid",                // Current message SID
+		}
+
+		for _, field := range possibleFields {
+			if value := r.FormValue(field); value != "" {
+				originalMessageSid = value
+				fmt.Fprintf(os.Stderr, "[Twilio] Found reply-to field %s: %s\n", field, value)
+				break
+			}
+		}
+
+		// Log ALL form values for debugging
+		fmt.Fprintf(os.Stderr, "[Twilio] All form values: %v\n", r.Form)
+
 		if from == "" || body == "" {
 			http.Error(w, "Missing From or Body", http.StatusBadRequest)
 			return
@@ -382,13 +564,24 @@ func main() {
 
 		// Format the from number for consistency
 		fromFormatted := formatPhoneNumber(from)
-		fmt.Fprintf(os.Stderr, "[Twilio] Received message from %s (formatted: %s): %s\n", from, fromFormatted, body)
+
+		// Log reply-to information if present
+		if originalMessageSid != "" {
+			fmt.Fprintf(os.Stderr, "[Twilio] Received REPLY from %s to message %s: %s\n", fromFormatted, originalMessageSid, body)
+		} else {
+			fmt.Fprintf(os.Stderr, "[Twilio] Received message from %s (formatted: %s): %s\n", from, fromFormatted, body)
+		}
 		fmt.Fprintf(os.Stderr, "[Twilio] Configured Twilio phone number: %s\n", formatPhoneNumber(twilioClient.GetPhoneNumber()))
 
-		// Store user message in history
+		// Store user message in history with reply-to context if present
+		messageContent := body
+		if originalMessageSid != "" {
+			messageContent = fmt.Sprintf("[Reply to message %s]: %s", originalMessageSid, body)
+		}
+
 		if err := messageHistory.AddMessage(fromFormatted, Message{
 			Role:        "user",
-			Content:     body,
+			Content:     messageContent,
 			Timestamp:   time.Now(),
 			PhoneNumber: fromFormatted,
 		}); err != nil {
@@ -412,7 +605,7 @@ func main() {
 
 			// Send final response via Twilio API
 			go func() {
-				if err := twilioClient.SendSMS(fromFormatted, response); err != nil {
+				if err := twilioClient.SendSMS(fromFormatted, response, ""); err != nil {
 					fmt.Fprintf(os.Stderr, "[Twilio] Failed to send SMS: %v\n", err)
 				} else {
 					fmt.Fprintf(os.Stderr, "[Twilio] SMS sent successfully to %s\n", fromFormatted)
@@ -450,6 +643,13 @@ func main() {
 			Timestamp: time.Now(),
 		})
 
+		// Get or create user for this session
+		user, err := messageHistory.GetOrCreateUser(sessionID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[Chat] Failed to get/create user: %v\n", err)
+			user = &User{PhoneNumber: sessionID, Name: ""}
+		}
+
 		// Get conversation context
 		conversationContext, err := messageHistory.GetHistoryAsContext(sessionID)
 		if err != nil {
@@ -465,7 +665,7 @@ func main() {
 
 		// Build a shopping-assistant agent on each request.
 		agent := agents.New("ShoppingAssistant").
-			WithInstructions(baseInstructions()).
+			WithInstructions(baseInstructions(*user)).
 			WithModel("gpt-4o").
 			WithTools(
 				mcpDiscoverStoreTool(),
@@ -513,9 +713,18 @@ func main() {
 
 // processTwilioMessage processes a message from Twilio with context
 func processTwilioMessage(ctx context.Context, history *MessageHistory, twilioClient *TwilioClient, phoneNumber, message string) string {
+	// Get or create user
+	user, err := history.GetOrCreateUser(phoneNumber)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[Twilio] Failed to get/create user: %v\n", err)
+		// Continue anyway, just without user context
+		user = &User{PhoneNumber: phoneNumber, Name: ""}
+	}
+
 	// Create conversation context
 	convCtx := &ConversationContext{
 		PhoneNumber:    phoneNumber,
+		UserName:       user.Name,
 		TwilioClient:   twilioClient,
 		MessageHistory: history,
 	}
@@ -535,7 +744,7 @@ func processTwilioMessage(ctx context.Context, history *MessageHistory, twilioCl
 
 	// Build a shopping-assistant agent with SMS capability
 	agent := agents.New("ShoppingAssistant").
-		WithInstructions(baseInstructions()).
+		WithInstructions(baseInstructions(*user)).
 		WithModel("gpt-4o").
 		WithTools(
 			mcpDiscoverStoreTool(),
@@ -546,6 +755,7 @@ func processTwilioMessage(ctx context.Context, history *MessageHistory, twilioCl
 			mcpCreateCheckoutTool(),
 			mcpSearchShopPoliciesTool(),
 			sendSMSTool(convCtx),
+			updateUserFieldTool(convCtx),
 		)
 
 	// Run the agent
@@ -561,31 +771,117 @@ func processTwilioMessage(ctx context.Context, history *MessageHistory, twilioCl
 }
 
 // baseInstructions provides the system prompt for the shopping assistant.
-func baseInstructions() string {
-	return strings.TrimSpace(`
-You are a **personal shopping assistant**.
+func baseInstructions(user User) string {
+	// Build user context based on what we know about the user
+	userContext := ""
+	if user.Name != "" {
+		userContext += fmt.Sprintf("The user's name is %s. ", user.Name)
+	}
+	if user.StreetAddress != "" {
+		userContext += "User has a saved shipping address. "
+	}
 
-Your goal is to help customers discover and compare products that best match what they are looking for.
+	// Build address status for the agent
+	addressStatus := ""
+	if user.Name == "" {
+		addressStatus += "- Name: NOT SET (ask for it!)\n"
+	} else {
+		addressStatus += fmt.Sprintf("- Name: %s ✓\n", user.Name)
+	}
+	if user.StreetAddress == "" {
+		addressStatus += "- Street Address: NOT SET (ask for it!)\n"
+	} else {
+		addressStatus += "- Street Address: ✓\n"
+	}
+	if user.AddressLocality == "" {
+		addressStatus += "- City: NOT SET\n"
+	} else {
+		addressStatus += fmt.Sprintf("- City: %s ✓\n", user.AddressLocality)
+	}
+	if user.PostalCode == "" {
+		addressStatus += "- Postal Code: NOT SET\n"
+	} else {
+		addressStatus += fmt.Sprintf("- Postal Code: %s ✓\n", user.PostalCode)
+	}
+	if user.AddressCountry == "" {
+		addressStatus += "- Country: NOT SET\n"
+	} else {
+		addressStatus += fmt.Sprintf("- Country: %s ✓\n", user.AddressCountry)
+	}
+
+	return strings.TrimSpace(fmt.Sprintf(`
+You are a **friendly personal shopper** - think of yourself as a helpful, enthusiastic shopping buddy!
+
+%s
+
+USER INFORMATION STATUS:
+%s
+
+CRITICAL - USER INFO COLLECTION:
+Before processing any shopping requests, collect the user's information at the RIGHT time:
+1. FIRST: Get their name (if not set)
+   - Ask warmly: "Hey there! 👋 I'm your personal shopping assistant! What's your name?"
+   - Use update_user_field tool with field="name" to save it
+   - ONLY proceed with shopping AFTER you know their name
+
+2. WHEN THEY'RE READY TO ADD TO CART: Get their shipping address
+   - ONLY ask for address when they're actually adding items to cart
+   - Ask naturally: "To make checkout super quick, I'll need your shipping address. What's your street address? 📦"
+   - Collect fields one by one as they provide them:
+     * street_address (e.g., "123 Main Street")
+     * address_locality (city)
+     * address_region (state/province)
+     * postal_code
+     * address_country (country code like "US", "ZA", etc.)
+   - Use update_user_field tool for each field
+
+3. For browsing products, you only need their name - NOT the address
+
+Your personality:
+- Warm, friendly, and conversational - like texting a friend
+- Use casual language, emojis when appropriate 😊
+- Be enthusiastic about helping find the perfect item
+- Ask follow-up questions to understand their style/preferences
+- Give genuine recommendations with personality
+- ALWAYS use the user's name in your responses once you know it
 
 SMS PRODUCT MESSAGING WORKFLOW:
-When you find products for a user, you MUST send each product as a separate SMS message:
+When you find products for a user, send each product as a separate, personalized SMS:
 1. Search for products using search_products or search_shop_catalog tools
 2. For EACH product found (maximum 3 products), send a separate SMS using the send_sms tool
-3. Format each product message as: "Product: [Name] - [Price] - [URL]"
-4. After sending all product messages, provide a brief summary in your final response
+3. Format each message conversationally with personality:
+   - "Ooh, check this out! ✨ [Product Name] - $[Price] - [URL]"
+   - "This would look amazing on you! 👗 [Product Name] - $[Price] - [URL]"
+   - "Perfect for what you need! 🎯 [Product Name] - $[Price] - [URL]"
+4. INCLUDE the product image URL in the MediaUrl parameter for MMS!
+5. After sending all product messages, provide a brief, friendly summary
+
+CHECKOUT PREFILL - CRITICAL:
+When the user is ready to checkout:
+- Use create_checkout tool with their stored address information
+- Prefill ALL available fields: name, email (if you have it), and full shipping address
+- The checkout should have minimal fields left for them to fill in
+- Tell them: "I've prefilled your checkout with your saved info - just review and confirm! 🛒"
 
 IMPORTANT RULES:
+- Collect name FIRST before shopping
+- ONLY ask for address when they're adding to cart (not when browsing)
 - Send AT MOST 3 products total
-- Each product gets its OWN SMS message via send_sms tool
-- ALWAYS include the product URL in each message so users can view it
+- Each product gets its OWN SMS with personality
+- ALWAYS include both product URL and image URL
+- Use emojis to add warmth and personality
 - Keep each SMS under 1600 characters
-- Send product messages immediately after finding them, don't wait
+- Sound like a helpful friend, not a robot
+- Always personalize by using their name
+- Use update_user_field tool to save any info they provide
+- Prefill checkout with ALL stored information
 
 Guidelines:
-- Ask brief clarification questions when the request is ambiguous.
-- Use the available tools to discover stores and search for products rather than guessing.
-- When showing products, summarize key attributes briefly (price range, style).
-`)
+- Get to know their preferences with friendly questions
+- Use the available tools to discover stores and search for products
+- Match your tone to their vibe - casual and fun!
+- Make shopping feel exciting and personal
+`, userContext, addressStatus))
 }
 
 // getEnv returns the value of the environment variable or a default.

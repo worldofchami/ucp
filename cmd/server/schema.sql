@@ -1,9 +1,19 @@
 -- Chat History Database Schema
 -- Compatible with SQLite and PostgreSQL
 
+-- Users table stores user information
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    phone_number TEXT UNIQUE NOT NULL,
+    name TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Conversations table stores conversation metadata
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
+    user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
     phone_number TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -28,7 +38,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
 -- Index for phone number lookups
 CREATE INDEX IF NOT EXISTS idx_conversations_phone ON conversations(phone_number);
 
--- Trigger to update the updated_at timestamp on conversations (SQLite syntax)
+-- Index for user phone number lookups
+CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone_number);
+
+-- Trigger to update the updated_at timestamp on users (SQLite syntax)
 -- For PostgreSQL, use:
 -- CREATE OR REPLACE FUNCTION update_updated_at_column()
 -- RETURNS TRIGGER AS $$
@@ -38,7 +51,7 @@ CREATE INDEX IF NOT EXISTS idx_conversations_phone ON conversations(phone_number
 -- END;
 -- $$ language 'plpgsql';
 --
--- CREATE TRIGGER update_conversations_updated_at
---     BEFORE UPDATE ON conversations
+-- CREATE TRIGGER update_users_updated_at
+--     BEFORE UPDATE ON users
 --     FOR EACH ROW
 --     EXECUTE FUNCTION update_updated_at_column();

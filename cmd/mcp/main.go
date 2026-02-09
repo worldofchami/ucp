@@ -1130,9 +1130,13 @@ func storefrontMCPProxy(ctx context.Context, storeURL, toolName string, argument
 				})
 			}
 		}
+		// Debug logging
+		fmt.Fprintf(os.Stderr, "[MCP] Tool %s returned %d content items\n", toolName, len(result))
 		return result, nil
 	}
 
+	// Debug logging for empty content
+	fmt.Fprintf(os.Stderr, "[MCP] Tool %s returned empty content, raw response: %s\n", toolName, string(respBody))
 	return []ucp.ContentItem{{
 		Type: "text",
 		Text: string(respBody),
@@ -1298,14 +1302,17 @@ func updateCartTool() tool {
 				}
 
 				// Handle both formats: item.id (from agent) and product_variant_id (direct)
+				// Ensure full GID format: gid://shopify/ProductVariant/XXX
 				if itemObj, ok := itemMap["item"].(map[string]any); ok {
 					// Format from agent: {"item": {"id": "..."}, "quantity": 1}
 					if id, ok := asString(itemObj, "id"); ok && id != "" {
-						transformedItem["product_variant_id"] = id
+						// Ensure full GID format
+						transformedItem["product_variant_id"] = ensureGIDFormat(id)
 					}
 				} else if variantID, ok := asString(itemMap, "product_variant_id"); ok && variantID != "" {
 					// Direct format: {"product_variant_id": "...", "quantity": 1}
-					transformedItem["product_variant_id"] = variantID
+					// Ensure full GID format
+					transformedItem["product_variant_id"] = ensureGIDFormat(variantID)
 				}
 
 				// Add line_item_id if present
@@ -1319,7 +1326,13 @@ func updateCartTool() tool {
 			}
 
 			if len(transformedItems) == 0 {
-				return nil, fmt.Errorf("no valid items to add to cart")
+				return nil, fmt.Errorf("no valid items to add to cart. Input items: %v", addItems)
+			}
+
+			// Debug logging
+			fmt.Fprintf(os.Stderr, "[MCP] update_cart: transformed %d items\n", len(transformedItems))
+			for i, item := range transformedItems {
+				fmt.Fprintf(os.Stderr, "[MCP]   Item %d: %v\n", i, item)
 			}
 
 			arguments := map[string]any{
@@ -1334,6 +1347,23 @@ func updateCartTool() tool {
 			return storefrontMCPProxy(ctx, storeURL, "update_cart", arguments)
 		},
 	}
+}
+
+// ensureGIDFormat ensures the variant ID is in full GID format
+// gid://shopify/ProductVariant/12345678901
+func ensureGIDFormat(variantID string) string {
+	// If it already starts with gid://, return as-is
+	if strings.HasPrefix(variantID, "gid://") {
+		return variantID
+	}
+
+	// If it's just a numeric ID, wrap it in the GID format
+	// Remove any query parameters like ?shop=XXX
+	if idx := strings.Index(variantID, "?"); idx != -1 {
+		variantID = variantID[:idx]
+	}
+
+	return fmt.Sprintf("gid://shopify/ProductVariant/%s", variantID)
 }
 
 func searchShopPoliciesAndFaqsTool() tool {

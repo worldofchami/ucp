@@ -8,7 +8,7 @@
 set -e
 
 PROJECT_ID=$(gcloud config get-value project)
-SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-ucp-service-account}"
+SERVICE_ACCOUNT_NAME="ucp-service-account"
 SERVICE_ACCOUNT_EMAIL="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 echo "Setting up service account for project: ${PROJECT_ID}"
